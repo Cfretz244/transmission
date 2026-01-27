@@ -18,6 +18,7 @@
 #import "FileListNode.h"
 #import "NSStringAdditions.h"
 #import "TrackerNode.h"
+#import "TransmissionOperationQueue.h"
 #import "Utils.h"
 
 NSString* const kTorrentDidChangeGroupNotification = @"TorrentDidChangeGroup";
@@ -299,6 +300,80 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
     }
 }
 
++ (void)updateTorrentsAsync:(NSArray<Torrent*>*)torrents completion:(void (^)(void))completion
+{
+    if (torrents == nil || torrents.count == 0)
+    {
+        if (completion)
+        {
+            completion();
+        }
+        return;
+    }
+
+    // Capture copies of everything we need for the background work
+    NSArray<Torrent*>* torrentsCopy = [torrents copy];
+
+    [[TransmissionOperationQueue sharedQueue] async:^{
+        std::vector<Torrent*> torrent_objects;
+        torrent_objects.reserve(torrentsCopy.count);
+
+        std::vector<tr_torrent*> torrent_handles;
+        torrent_handles.reserve(torrentsCopy.count);
+
+        std::vector<BOOL> was_transmitting;
+        was_transmitting.reserve(torrentsCopy.count);
+
+        for (Torrent* torrent in torrentsCopy)
+        {
+            if (torrent == nil || torrent.fHandle == nullptr)
+            {
+                continue;
+            }
+
+            torrent_objects.emplace_back(torrent);
+            torrent_handles.emplace_back(torrent.fHandle);
+            was_transmitting.emplace_back(torrent.fStat != nullptr && torrent.transmitting);
+        }
+
+        if (torrent_handles.empty())
+        {
+            if (completion)
+            {
+                dispatch_async(dispatch_get_main_queue(), completion);
+            }
+            return;
+        }
+
+        auto const stats = tr_torrentStat(torrent_handles.data(), torrent_handles.size());
+
+        // Must update stats and check transmitting changes on main thread
+        // to ensure thread-safe access to Torrent properties
+        dispatch_async(dispatch_get_main_queue(), ^{
+            for (size_t i = 0, n = torrent_objects.size(); i < n; ++i)
+            {
+                Torrent* const torrent = torrent_objects[i];
+                BOOL wasTransmitting = was_transmitting[i];
+                torrent.fStat = stats[i];
+
+                if (wasTransmitting != torrent.transmitting)
+                {
+                    [NSNotificationQueue.defaultQueue enqueueNotification:[NSNotification notificationWithName:@"UpdateTorrentsState"
+                                                                                                        object:nil]
+                                                             postingStyle:NSPostASAP
+                                                             coalesceMask:NSNotificationCoalescingOnName
+                                                                 forModes:nil];
+                }
+            }
+
+            if (completion)
+            {
+                completion();
+            }
+        });
+    } completion:nil]; // We handle main thread dispatch ourselves above
+}
+
 - (void)startTransferIgnoringQueue:(BOOL)ignoreQueue
 {
     if ([self alertForRemainingDiskSpace])
@@ -530,9 +605,18 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
 
 - (void)moveTorrentDataFileTo:(NSString*)folder
 {
+    [self moveTorrentDataFileTo:folder completionHandler:nil];
+}
+
+- (void)moveTorrentDataFileTo:(NSString*)folder completionHandler:(void (^)(BOOL success))completion
+{
     NSString* oldFolder = self.currentDirectory;
     if ([oldFolder isEqualToString:folder])
     {
+        if (completion)
+        {
+            completion(YES);
+        }
         return;
     }
 
@@ -551,33 +635,52 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
 
         [alert runModal];
 
+        if (completion)
+        {
+            completion(NO);
+        }
         return;
     }
 
-    int volatile status;
-    tr_torrentSetLocation(self.fHandle, folder.UTF8String, YES, &status);
+    // Capture handle and name for use in background block
+    tr_torrent* handle = self.fHandle;
+    NSString* torrentName = self.name;
 
-    while (status == TR_LOC_MOVING) //block while moving (for now)
-    {
-        [NSThread sleepForTimeInterval:0.05];
-    }
+    [[TransmissionOperationQueue sharedQueue] asyncWithResult:^{
+        int volatile status;
+        tr_torrentSetLocation(handle, folder.UTF8String, YES, &status);
 
-    if (status == TR_LOC_DONE)
-    {
-        [NSNotificationCenter.defaultCenter postNotificationName:@"UpdateStats" object:nil];
-    }
-    else
-    {
-        NSAlert* alert = [[NSAlert alloc] init];
-        alert.messageText = NSLocalizedString(@"There was an error moving the data file.", "Move error alert -> title");
-        alert.informativeText = [NSString
-            stringWithFormat:NSLocalizedString(@"The move operation of \"%@\" cannot be done.", "Move error alert -> message"), self.name];
-        [alert addButtonWithTitle:NSLocalizedString(@"OK", "Move error alert -> button")];
+        while (status == TR_LOC_MOVING)
+        {
+            [NSThread sleepForTimeInterval:0.05];
+        }
 
-        [alert runModal];
-    }
+        return @(status);
+    } completion:^(NSNumber* result) {
+        int status = result.intValue;
 
-    [self updateTimeMachineExclude];
+        if (status == TR_LOC_DONE)
+        {
+            [NSNotificationCenter.defaultCenter postNotificationName:@"UpdateStats" object:nil];
+        }
+        else
+        {
+            NSAlert* alert = [[NSAlert alloc] init];
+            alert.messageText = NSLocalizedString(@"There was an error moving the data file.", "Move error alert -> title");
+            alert.informativeText = [NSString
+                stringWithFormat:NSLocalizedString(@"The move operation of \"%@\" cannot be done.", "Move error alert -> message"), torrentName];
+            [alert addButtonWithTitle:NSLocalizedString(@"OK", "Move error alert -> button")];
+
+            [alert runModal];
+        }
+
+        [self updateTimeMachineExclude];
+
+        if (completion)
+        {
+            completion(status == TR_LOC_DONE);
+        }
+    }];
 }
 
 - (void)copyTorrentFileTo:(NSString*)path
