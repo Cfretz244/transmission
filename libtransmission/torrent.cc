@@ -1145,15 +1145,23 @@ void tr_torrent::set_location(std::string_view location, bool move_from_old_path
 
             auto old_path = std::string{ tor->current_dir() };
             auto const top_name = std::string{ tor->name() };
+            auto const old_download_dir = tor->download_dir_;
+            auto const old_incomplete_dir = tor->incomplete_dir_;
+            auto const old_current_dir = tor->current_dir_;
             session->local_data.move(
                 tor_id,
                 tor->files(),
                 old_path,
                 path,
                 top_name,
-                [session, tor_id, path = std::move(path), old_path = std::move(old_path), setme_state](
-                    tr_torrent_id_t,
-                    tr_error const& error) mutable
+                [session,
+                 tor_id,
+                 path,
+                 old_path = std::move(old_path),
+                 old_download_dir,
+                 old_incomplete_dir,
+                 old_current_dir,
+                 setme_state](tr_torrent_id_t, tr_error const& error) mutable
                 {
                     auto lock = session->unique_lock();
                     auto* const tor = session->torrents().get(tor_id);
@@ -1164,6 +1172,9 @@ void tr_torrent::set_location(std::string_view location, bool move_from_old_path
 
                     if (error)
                     {
+                        tor->download_dir_ = old_download_dir;
+                        tor->incomplete_dir_ = old_incomplete_dir;
+                        tor->current_dir_ = old_current_dir;
                         tor->error().set_local_error(
                             fmt::format(
                                 fmt::runtime(_("Couldn't move '{old_path}' to '{path}': {error} ({error_code})")),
@@ -1190,6 +1201,13 @@ void tr_torrent::set_location(std::string_view location, bool move_from_old_path
                         *setme_state = TR_LOC_DONE;
                     }
                 });
+
+            // Point the torrent at the destination now. LocalData runs the torrent's
+            // tasks in order, so I/O planned from here on runs after the move and
+            // must use the new paths; the callback reverts them if the move fails.
+            tor->download_dir_ = path;
+            tor->incomplete_dir_.clear();
+            tor->current_dir_ = tor->download_dir_;
         });
 }
 
@@ -1696,6 +1714,8 @@ std::optional<std::string> tr_torrent::VerifyMediator::find_file(tr_file_index_t
     return {};
 }
 
+// While LocalData moves the torrent, its dirs already name the destination,
+// so a file the move has not reached yet is not found and keeps its suffix.
 void tr_torrent::update_file_path(tr_file_index_t file, std::optional<bool> has_file) const
 {
     auto const found = find_file(file);
