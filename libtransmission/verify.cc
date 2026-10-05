@@ -135,11 +135,7 @@ void tr_verify_worker::verify_thread_func()
         {
             auto const lock = std::scoped_lock{ verify_mutex_ };
 
-            if (stop_current_)
-            {
-                stop_current_ = false;
-                stop_current_cv_.notify_one();
-            }
+            stop_current_ = false;
 
             if (std::empty(todo_))
             {
@@ -172,12 +168,15 @@ void tr_verify_worker::add(std::unique_ptr<Mediator> mediator, tr_priority_t pri
 
 void tr_verify_worker::remove(tr_sha1_digest_t const& info_hash)
 {
-    auto lock = std::unique_lock(verify_mutex_);
+    auto const lock = std::scoped_lock{ verify_mutex_ };
 
     if (current_node_ && current_node_->matches(info_hash))
     {
+        // Flag the thread and return. It drops the node at its next piece
+        // boundary; the mediator owns everything the verify reads, and its
+        // caller treats results still in flight as stale, so nothing here
+        // has to wait on a read that may be stuck on a slow disk.
         stop_current_ = true;
-        stop_current_cv_.wait(lock, [this]() { return !stop_current_; });
     }
     else if (auto const iter = std::ranges::find_if(todo_, [&info_hash](auto const& node) { return node.matches(info_hash); });
              iter != std::ranges::end(todo_))

@@ -68,6 +68,7 @@ target_sources(libtransmission-test
         tr-peer-info-test.cc
         utils-test.cc
         values-test.cc
+        verify-test.cc
         variant-test.cc
         watchdir-test.cc
         web-test.cc

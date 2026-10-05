@@ -2140,12 +2140,14 @@ size_t tr_sessionGetQueueStalledMinutes(tr_session const* session)
 
 // ---
 
-void tr_session::verify_remove(tr_torrent const* const tor)
+void tr_session::verify_remove(tr_torrent* const tor)
 {
     if (verifier_)
     {
         verifier_->remove(tor->info_hash());
     }
+
+    tor->on_verify_removed();
 }
 
 void tr_session::verify_add(tr_torrent* const tor)

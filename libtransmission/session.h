@@ -1045,7 +1045,7 @@ public:
     }
 
     void verify_add(tr_torrent* tor);
-    void verify_remove(tr_torrent const* tor);
+    void verify_remove(tr_torrent* tor);
 
     void fetch(tr_web::FetchOptions&& options) const
     {

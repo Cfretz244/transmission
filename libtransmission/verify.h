@@ -10,7 +10,6 @@
 #endif
 
 #include <atomic>
-#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -98,7 +97,6 @@ private:
     std::optional<std::thread::id> verify_thread_id_;
 
     std::atomic<bool> stop_current_ = false;
-    std::condition_variable stop_current_cv_;
 
     std::chrono::milliseconds sleep_per_seconds_during_verify_ = {};
 };

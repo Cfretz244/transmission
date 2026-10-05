@@ -10,6 +10,7 @@
 #endif
 
 #include <cstddef> // size_t
+#include <chrono>
 #include <cstdint> // uint64_t, uint16_t
 #include <deque>
 #include <ctime>
@@ -151,17 +152,25 @@ struct tr_torrent
 
     using VerifyDoneCallback = std::function<void(tr_torrent*)>;
 
+    // Drives one verify on tr_verify_worker's thread. It owns a copy of
+    // everything the verify reads (metainfo, search paths) and never touches
+    // the torrent from that thread: piece results hop to the session thread
+    // by torrent id, tagged with the verify generation they belong to, and
+    // are dropped if the torrent is gone or was pulled off the verifier
+    // since. So stopping a verify only flags the worker thread; nobody waits
+    // on a read that may be stuck on a slow disk.
     class VerifyMediator : public tr_verify_worker::Mediator
     {
     public:
-        explicit VerifyMediator(tr_torrent* const tor)
-            : tor_{ tor }
-        {
-        }
+        explicit VerifyMediator(tr_torrent const* tor);
 
         ~VerifyMediator() override = default;
 
-        [[nodiscard]] tr_torrent_metainfo const& metainfo() const override;
+        [[nodiscard]] tr_torrent_metainfo const& metainfo() const override
+        {
+            return metainfo_;
+        }
+
         [[nodiscard]] std::optional<std::string> find_file(tr_file_index_t file_index) const override;
 
         void on_verify_queued() override;
@@ -170,8 +179,26 @@ struct tr_torrent
         void on_verify_done(bool aborted) override;
 
     private:
-        tr_torrent* const tor_;
+        // Runs `func` on the session thread against this verify's torrent,
+        // unless the torrent is gone, is being deleted, or has been pulled
+        // off the verifier since this verify was queued.
+        void post(std::function<void(tr_torrent&)> func) const;
+
+        void flush_checked_pieces();
+
+        tr_session* const session_;
+        std::shared_ptr<tr_session::SessionThreadPoster> const poster_;
+        tr_torrent_id_t const tor_id_;
+        uint32_t const generation_;
+        tr_torrent_metainfo const metainfo_;
+        std::vector<std::string> search_paths_;
+
         std::optional<time_t> time_started_;
+
+        // Piece results waiting to hop to the session thread. Batched so a
+        // many-piece verify on a fast disk does not post a closure per piece.
+        std::vector<std::pair<tr_piece_index_t, bool>> checked_;
+        std::chrono::steady_clock::time_point last_flush_ = {};
     };
 
     // ---
@@ -538,6 +565,10 @@ struct tr_torrent
     [[nodiscard]] std::optional<tr_torrent_files::FoundFile> find_file(tr_file_index_t file_index) const;
 
     [[nodiscard]] bool has_any_local_data() const;
+
+    // Called by the session when it pulls the torrent off the verify worker.
+    // Any results still in flight from that verify are stale from here on.
+    void on_verify_removed();
 
     // Snapshots what LocalData needs to read or write `byte_span`.
     // Call on the session thread. See tr_io_plan.
@@ -1539,6 +1570,10 @@ private:
     tr_idlelimit idle_limit_mode_ = TR_IDLELIMIT_GLOBAL;
 
     VerifyState verify_state_ = VerifyState::None;
+
+    // Bumped by on_verify_removed(). A VerifyMediator carries the value it
+    // was queued with and its posted results are dropped on a mismatch.
+    uint32_t verify_generation_ = 0U;
 
     tr_completeness completeness_ = TR_LEECH;
 
