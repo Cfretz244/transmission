@@ -4,10 +4,14 @@
 // License text can be found in the licenses/ folder.
 
 #include <algorithm>
+#include <ctime>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
+
+#include <utime.h>
 
 #include <gtest/gtest.h>
 
@@ -499,6 +503,158 @@ INSTANTIATE_TEST_SUITE_P(
 /***
 ****
 ***/
+
+class PieceCheckTest : public SessionTest
+{
+protected:
+    static auto constexpr MaxWaitMsec = 3000;
+
+    struct CheckLog
+    {
+        size_t n_answers = 0;
+        size_t n_passed = 0;
+    };
+
+    // Connects `log` to the torrent's piece_checked_ signal. Session thread only.
+    static void log_checks(tr_torrent* tor, CheckLog* log)
+    {
+        tor->piece_checked_.connect(
+            [log](tr_torrent*, tr_piece_index_t, bool const passed)
+            {
+                ++log->n_answers;
+                if (passed)
+                {
+                    ++log->n_passed;
+                }
+            });
+    }
+
+    // Adds the zero torrent over complete, zero-filled files whose mtimes
+    // are old enough for the add-time seed check to skip the full verify,
+    // so only piece 0 is checked and the rest are held but unchecked.
+    [[nodiscard]] tr_torrent* addZeroSeed()
+    {
+        auto* const ctor = zeroTorrentCtor();
+        auto const& metainfo = *tr_ctorGetMetainfo(ctor);
+        auto const dir = tr_sessionGetDownloadDir(session_);
+        auto const mtime = time(nullptr) - 3600;
+        for (tr_file_index_t i = 0, n = metainfo.file_count(); i < n; ++i)
+        {
+            auto const& subpath = metainfo.file_subpath(i);
+            auto const filename = tr_pathbuf{ dir, '/', subpath };
+            tr_sys_dir_create(tr_sys_path_dirname(filename), TR_SYS_DIR_CREATE_PARENTS, 0700);
+            auto const contents = std::vector<char>(metainfo.file_size(i), '\0');
+            auto const fd = tr_sys_file_open(filename, TR_SYS_FILE_WRITE | TR_SYS_FILE_CREATE | TR_SYS_FILE_TRUNCATE, 0600);
+            EXPECT_NE(TR_BAD_SYS_FILE, fd);
+            EXPECT_TRUE(tr_sys_file_write(fd, std::data(contents), std::size(contents), nullptr));
+            EXPECT_TRUE(tr_sys_file_close(fd));
+            auto const times = utimbuf{ mtime, mtime };
+            EXPECT_EQ(0, utime(filename.c_str(), &times));
+        }
+
+        auto* const tor = tr_torrentNew(ctor, nullptr);
+        tr_ctorFree(ctor);
+        EXPECT_NE(nullptr, tor);
+        EXPECT_TRUE(tor->has_all());
+        return tor;
+    }
+
+    // Queues a read of `piece`'s first block behind whatever is already in
+    // the torrent's LocalData FIFO, and waits for it. Anything queued before
+    // the call, e.g. a piece check, has answered by the time this returns.
+    void drain_local_data(tr_torrent* tor, tr_piece_index_t piece)
+    {
+        auto done = false;
+        session_->local_data.read(
+            tor->make_io_plan(tor->block_info().byte_span_for_block(tor->block_span_for_piece(piece).begin)),
+            [&done](tr_torrent_id_t, tr_byte_span_t, tr_error const&, std::unique_ptr<tr::LocalData::BlockData>)
+            { done = true; });
+        EXPECT_TRUE(waitFor([&done]() { return done; }, MaxWaitMsec));
+    }
+};
+
+// A peer asking for every block of an unchecked piece used to queue one
+// full-piece hash per block. Requests for a piece whose check is already
+// in flight must share it, and each request still gets its answer.
+TEST_F(PieceCheckTest, requestsForOnePieceShareOneCheck)
+{
+    auto* const tor = addZeroSeed();
+    auto constexpr Piece = tr_piece_index_t{ 1U };
+    ASSERT_TRUE(tor->has_piece(Piece));
+    ASSERT_FALSE(tor->is_piece_checked(Piece)); // only piece 0 is hashed at add time
+
+    auto log = CheckLog{};
+    auto requested = false;
+    session_->run_in_session_thread(
+        [tor, &log, &requested]()
+        {
+            log_checks(tor, &log);
+            tor->request_piece_check(Piece);
+            tor->request_piece_check(Piece);
+            requested = true;
+        });
+    EXPECT_TRUE(waitFor([&requested]() { return requested; }, MaxWaitMsec));
+    drain_local_data(tor, Piece);
+
+    // one check answered once, and the piece is now known-good
+    EXPECT_TRUE(waitFor([&log]() { return log.n_answers != 0U; }, MaxWaitMsec));
+    EXPECT_EQ(1U, log.n_answers);
+    EXPECT_EQ(1U, log.n_passed);
+    EXPECT_TRUE(tor->is_piece_checked(Piece));
+    EXPECT_FALSE(tor->error().is_local_error());
+
+    // a request for a checked piece answers at once, without another hash
+    auto answered = false;
+    session_->run_in_session_thread(
+        [tor, &log, &answered]()
+        {
+            tor->request_piece_check(Piece);
+            answered = log.n_answers == 2U;
+        });
+    EXPECT_TRUE(waitFor([&answered]() { return answered; }, MaxWaitMsec));
+    EXPECT_EQ(2U, log.n_passed);
+
+    tr_torrentRemove(tor, true);
+}
+
+// A piece whose bytes changed under us must not be served: the check fails,
+// the piece stays unchecked, and the torrent reports a local error.
+TEST_F(PieceCheckTest, corruptPieceFailsItsCheck)
+{
+    auto* const tor = addZeroSeed();
+    auto constexpr Piece = tr_piece_index_t{ 1U };
+    ASSERT_TRUE(tor->has_piece(Piece));
+    ASSERT_FALSE(tor->is_piece_checked(Piece));
+
+    // flip a byte in the middle of the piece on disk
+    auto const [file, offset] = tor->file_offset(tor->piece_loc(Piece, tor->piece_size(Piece) / 2U));
+    auto const filename = std::string{ tr_torrentFindFile(tor, file) };
+    ASSERT_FALSE(std::empty(filename));
+    auto const fd = tr_sys_file_open(filename, TR_SYS_FILE_WRITE, 0600);
+    ASSERT_NE(TR_BAD_SYS_FILE, fd);
+    auto constexpr Byte = char{ '\x7f' };
+    EXPECT_TRUE(tr_sys_file_write_at(fd, &Byte, 1U, offset, nullptr));
+    EXPECT_TRUE(tr_sys_file_close(fd));
+
+    auto log = CheckLog{};
+    auto requested = false;
+    session_->run_in_session_thread(
+        [tor, &log, &requested]()
+        {
+            log_checks(tor, &log);
+            tor->request_piece_check(Piece);
+            requested = true;
+        });
+    EXPECT_TRUE(waitFor([&requested]() { return requested; }, MaxWaitMsec));
+    EXPECT_TRUE(waitFor([&log]() { return log.n_answers != 0U; }, MaxWaitMsec));
+
+    EXPECT_EQ(1U, log.n_answers);
+    EXPECT_EQ(0U, log.n_passed);
+    EXPECT_FALSE(tor->is_piece_checked(Piece));
+    EXPECT_TRUE(tor->error().is_local_error());
+
+    tr_torrentRemove(tor, true);
+}
 
 using MoveTest = SessionTest;
 

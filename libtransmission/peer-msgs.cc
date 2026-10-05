@@ -28,6 +28,7 @@
 #include <fmt/format.h>
 
 #include <small/vector.hpp>
+#include <sigslot/signal.hpp>
 
 #include "libtransmission/bep55-holepunch.h"
 #include "libtransmission/bitfield.h"
@@ -334,6 +335,9 @@ public:
         update_desired_request_count();
 
         update_active();
+
+        piece_checked_tag_ = tor_.piece_checked_.connect_scoped(
+            [this](tr_torrent* /*tor*/, tr_piece_index_t piece, bool passed) { on_piece_checked(piece, passed); });
     }
 
     tr_peerMsgsImpl(tr_peerMsgsImpl&&) = delete;
@@ -577,12 +581,17 @@ private:
     struct queued_peer_request
     {
         peer_request req;
-        uint64_t token = 0;
+        uint64_t token = 0; // nonzero while a LocalData read is in flight
+        bool awaiting_check = false; // true while tor_.request_piece_check() is in flight
         std::shared_ptr<tr::LocalData::BlockData> data;
 
-        [[nodiscard]] bool is_read_pending() const noexcept
+        // true if the request can't be answered yet: its block is still
+        // being read, or its piece is still being hashed. add_next_block()
+        // waits for the front of the queue rather than skipping it, so the
+        // peer gets its blocks in the order it asked for them.
+        [[nodiscard]] bool is_pending() const noexcept
         {
-            return token != 0;
+            return token != 0 || awaiting_check;
         }
     };
 
@@ -626,111 +635,87 @@ private:
         fill_output_buffer(tr_time(), tr_time_msec());
     }
 
-    void schedule_peer_request_read(peer_request const& req)
+    void enqueue_local_data_read(peer_request const& req, uint64_t const token)
     {
         auto const byte_span = tor_.block_info().byte_span_for_req(req.index, req.offset, req.length);
-        auto const weak = weak_from_this();
         auto* const session = this->session;
-
-        auto const enqueue_local_data_read = [byte_span, session, weak](tr_torrent const& tor, uint64_t const token)
-        {
-            session->local_data.read(
-                tor.make_io_plan(byte_span),
-                [weak, session, token](
-                    tr_torrent_id_t /*tor_id*/,
-                    tr_byte_span_t /*byte_span*/,
-                    tr_error const& error,
-                    std::unique_ptr<tr::LocalData::BlockData> data) mutable
-                {
-                    auto shared_data = std::shared_ptr<tr::LocalData::BlockData>{ std::move(data) };
-                    session->run_in_session_thread(
-                        [weak, token, error, data = std::move(shared_data)]() mutable
+        session->local_data.read(
+            tor_.make_io_plan(byte_span),
+            [weak = weak_from_this(), session, token](
+                tr_torrent_id_t /*tor_id*/,
+                tr_byte_span_t /*byte_span*/,
+                tr_error const& error,
+                std::unique_ptr<tr::LocalData::BlockData> data) mutable
+            {
+                auto shared_data = std::shared_ptr<tr::LocalData::BlockData>{ std::move(data) };
+                session->run_in_session_thread(
+                    [weak, token, error, data = std::move(shared_data)]() mutable
+                    {
+                        if (auto self = weak.lock())
                         {
-                            if (auto self = weak.lock())
-                            {
-                                self->on_local_data_read_done(token, error, std::move(data));
-                            }
-                        });
-                });
-        };
+                            self->on_local_data_read_done(token, error, std::move(data));
+                        }
+                    });
+            });
+    }
 
+    void schedule_peer_request_read(peer_request const& req)
+    {
         if (tor_.is_piece_checked(req.index))
         {
             auto const token = next_peer_request_token();
             pending_peer_read_tokens_.insert(token);
-            peer_requested_.emplace_back(req, token, std::make_shared<tr::LocalData::BlockData>());
-            enqueue_local_data_read(tor_, token);
+            peer_requested_.emplace_back(req, token, false, std::make_shared<tr::LocalData::BlockData>());
+            enqueue_local_data_read(req, token);
             return;
         }
 
-        peer_requested_.emplace_back(req, 0U, std::make_shared<tr::LocalData::BlockData>());
+        // The piece hasn't been hashed since its file changed. Park the
+        // request until the torrent's (shared, deduplicated) check answers
+        // via piece_checked_; on_piece_checked() then reads or rejects it.
+        peer_requested_.emplace_back(req, 0U, true, std::make_shared<tr::LocalData::BlockData>());
+        tor_.request_piece_check(req.index);
+    }
 
-        session->local_data.test_piece(
-            tor_.make_io_plan(tor_.block_info().byte_span_for_piece(req.index)),
-            req.index,
-            [weak, session, req, enqueue_local_data_read](
-                tr_torrent_id_t tor_id,
-                tr_piece_index_t piece,
-                tr_error const& error,
-                std::optional<tr_sha1_digest_t> hash)
+    void on_piece_checked(tr_piece_index_t const piece, bool const passed)
+    {
+        TR_ASSERT(session->am_in_session_thread());
+
+        auto n_changed = size_t{};
+
+        for (auto it = std::begin(peer_requested_); it != std::end(peer_requested_);)
+        {
+            if (!it->awaiting_check || it->req.index != piece)
             {
-                session->run_in_session_thread(
-                    [weak, session, tor_id, req, piece, error, hash = std::move(hash), enqueue_local_data_read]()
-                    {
-                        auto* const tor = session->torrents().get(tor_id);
-                        if (tor == nullptr)
-                        {
-                            return;
-                        }
+                ++it;
+                continue;
+            }
 
-                        if (error)
-                        {
-                            tor->error().set_local_error(
-                                fmt::format(
-                                    fmt::runtime(_("Couldn't verify piece #{piece}: {error} ({error_code})")),
-                                    fmt::arg("piece", piece),
-                                    fmt::arg("error", error.message()),
-                                    fmt::arg("error_code", error.code())));
+            ++n_changed;
 
-                            if (auto self = weak.lock(); self != nullptr)
-                            {
-                                self->fill_output_buffer(tr_time(), tr_time_msec());
-                            }
+            if (passed)
+            {
+                auto const token = next_peer_request_token();
+                pending_peer_read_tokens_.insert(token);
+                it->awaiting_check = false;
+                it->token = token;
+                enqueue_local_data_read(it->req, token);
+                ++it;
+                continue;
+            }
 
-                            return;
-                        }
+            if (io_->supports_fext())
+            {
+                protocol_send_reject(it->req);
+            }
 
-                        auto const ok = hash == tor->piece_hash(piece);
-                        tor->set_piece_is_checked(piece, ok);
+            it = peer_requested_.erase(it);
+        }
 
-                        auto self = weak.lock();
-                        if (self == nullptr)
-                        {
-                            return;
-                        }
-
-                        if (!ok)
-                        {
-                            tor->error().set_local_error(
-                                fmt::format("Please Verify Local Data! Piece #{:d} is corrupt.", piece));
-                            self->fill_output_buffer(tr_time(), tr_time_msec());
-                            return;
-                        }
-
-                        auto const it = std::ranges::find_if(
-                            self->peer_requested_,
-                            [req](queued_peer_request const& queued) { return queued.token == 0U && queued.req == req; });
-                        if (it == std::end(self->peer_requested_))
-                        {
-                            return;
-                        }
-
-                        auto const token = self->next_peer_request_token();
-                        self->pending_peer_read_tokens_.insert(token);
-                        it->token = token;
-                        enqueue_local_data_read(*tor, token);
-                    });
-            });
+        if (n_changed != 0U)
+        {
+            fill_output_buffer(tr_time(), tr_time_msec());
+        }
     }
 
     void reject_all_requests()
@@ -915,6 +900,7 @@ private:
     std::deque<queued_peer_request> peer_requested_;
     std::unordered_set<uint64_t> pending_peer_read_tokens_;
     uint64_t next_peer_request_token_ = 1;
+    sigslot::scoped_connection piece_checked_tag_;
 
     std::array<std::vector<tr_pex>, NUM_TR_AF_INET_TYPES> pex_;
 
@@ -2359,7 +2345,7 @@ void tr_peerMsgsImpl::check_request_timeout(time_t const now)
     }
 
     auto const& queued_req = peer_requested_.front();
-    if (queued_req.is_read_pending())
+    if (queued_req.is_pending())
     {
         return {};
     }

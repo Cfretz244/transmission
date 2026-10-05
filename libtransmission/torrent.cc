@@ -881,6 +881,73 @@ bool tr_torrent::check_piece_now(tr_piece_index_t const piece)
     return passed;
 }
 
+void tr_torrent::request_piece_check(tr_piece_index_t const piece)
+{
+    TR_ASSERT(session->am_in_session_thread());
+    TR_ASSERT(piece < piece_count());
+
+    if (is_piece_checked(piece))
+    {
+        piece_checked_(this, piece, true);
+        return;
+    }
+
+    if (!requested_piece_checks_.insert(piece).second)
+    {
+        return; // a check for this piece is already queued; share its answer
+    }
+
+    auto const on_tested = [session = this->session](
+                               tr_torrent_id_t tor_id,
+                               tr_piece_index_t piece,
+                               tr_error const& error,
+                               std::optional<tr_sha1_digest_t> hash)
+    {
+        session->run_in_session_thread(
+            [session, tor_id, piece, error, hash = std::move(hash)]()
+            {
+                auto* const tor = session->torrents().get(tor_id);
+                if (tor == nullptr)
+                {
+                    return;
+                }
+
+                tor->requested_piece_checks_.erase(piece);
+
+                if (error.code() == ECANCELED)
+                {
+                    // The torrent is going away; the piece is unchecked, not broken.
+                    tor->piece_checked_(tor, piece, false);
+                    return;
+                }
+
+                if (error)
+                {
+                    tor->error().set_local_error(
+                        fmt::format(
+                            fmt::runtime(_("Couldn't verify piece #{piece}: {error} ({error_code})")),
+                            fmt::arg("piece", piece),
+                            fmt::arg("error", error.message()),
+                            fmt::arg("error_code", error.code())));
+                    tor->piece_checked_(tor, piece, false);
+                    return;
+                }
+
+                auto const passed = hash == tor->piece_hash(piece);
+                tr_logAddTraceTor(tor, fmt::format("[LAZY] tested piece {}, pass=={}", piece, passed));
+                tor->set_piece_is_checked(piece, passed);
+                if (!passed)
+                {
+                    tor->error().set_local_error(fmt::format("Please Verify Local Data! Piece #{:d} is corrupt.", piece));
+                }
+
+                tor->piece_checked_(tor, piece, passed);
+            });
+    };
+
+    session->local_data.test_piece(make_io_plan(block_info().byte_span_for_piece(piece)), piece, on_tested);
+}
+
 void tr_torrent::on_metainfo_updated()
 {
     completion_ = tr_completion{ this, &block_info() };
@@ -2405,6 +2472,9 @@ void tr_torrent::on_block_received(tr_block_index_t const block)
 
                     if (hash == tor->piece_hash(piece))
                     {
+                        // Peers will request this piece as soon as they see
+                        // our HAVE; this check is proof enough for them.
+                        tor->set_piece_is_checked(piece, true);
                         tor->on_piece_completed(piece);
                     }
                     else

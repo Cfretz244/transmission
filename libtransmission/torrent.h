@@ -18,6 +18,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -670,6 +671,14 @@ struct tr_torrent
     // other check goes through LocalData::test_piece().
     bool check_piece_now(tr_piece_index_t piece);
 
+    // Hashes a held-but-unchecked `piece` off the session thread, records
+    // the result with set_piece_is_checked(), and then emits piece_checked_.
+    // Requests for a piece whose check is already in flight share that
+    // check, so a peer asking for every block of a piece costs one hash.
+    // A piece that is already checked answers synchronously, from inside
+    // this call. Session thread only.
+    void request_piece_check(tr_piece_index_t piece);
+
     ///
 
     [[nodiscard]] tr_stat stats() const;
@@ -1053,6 +1062,9 @@ struct tr_torrent
     sigslot::signal<tr_torrent*, bool /*because_downloaded_last_piece*/> done_;
     sigslot::signal<tr_torrent*, tr_piece_index_t> got_bad_piece_;
     sigslot::signal<tr_torrent*, tr_piece_index_t> piece_completed_;
+    // Answer to request_piece_check(): `passed` is false for a corrupt
+    // piece and for one that could not be read or whose check was cancelled.
+    sigslot::signal<tr_torrent*, tr_piece_index_t, bool /*passed*/> piece_checked_;
     sigslot::signal<tr_torrent*> doomed_;
     sigslot::signal<tr_torrent*> got_metainfo_;
     sigslot::signal<tr_torrent*> started_;
@@ -1494,6 +1506,9 @@ private:
     // Both counters are touched only on the session thread.
     size_t n_pending_piece_tests_ = 0;
     uint64_t pending_piece_test_bytes_ = 0;
+
+    // Pieces with a request_piece_check() in flight. Session thread only.
+    std::unordered_set<tr_piece_index_t> requested_piece_checks_;
 
     bool sequential_download_ = false;
 
