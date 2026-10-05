@@ -306,6 +306,19 @@ struct tr_torrent
         return completion_.left_until_done();
     }
 
+    // Bytes in pieces whose blocks have all arrived but whose hash check
+    // has not finished. Those bytes are counted by completion_ already;
+    // anything reported to a tracker must not count them as complete.
+    [[nodiscard]] constexpr auto unverified_bytes() const noexcept
+    {
+        return pending_piece_test_bytes_;
+    }
+
+    [[nodiscard]] constexpr bool has_pending_piece_tests() const noexcept
+    {
+        return n_pending_piece_tests_ != 0U;
+    }
+
     [[nodiscard]] auto size_when_done() const
     {
         return completion_.size_when_done();
@@ -1457,6 +1470,11 @@ private:
     bool finished_seeding_by_idle_ = false;
 
     bool needs_completeness_check_ = true;
+
+    // Piece hash checks enqueued to LocalData and not yet answered.
+    // Both counters are touched only on the session thread.
+    size_t n_pending_piece_tests_ = 0;
+    uint64_t pending_piece_test_bytes_ = 0;
 
     bool sequential_download_ = false;
 

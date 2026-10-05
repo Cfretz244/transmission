@@ -1852,7 +1852,18 @@ void tr_torrent::recheck_completeness()
 
     needs_completeness_check_ = false;
 
-    if (auto const new_completeness = completion_.status(); completeness_ != new_completeness)
+    auto const new_completeness = completion_.status();
+
+    // A piece whose hash check is still queued may yet fail. Do not report
+    // the torrent complete (and so send a `completed` announce) until every
+    // check has answered; the last answer re-arms this check.
+    if (new_completeness != TR_LEECH && completeness_ == TR_LEECH && has_pending_piece_tests())
+    {
+        needs_completeness_check_ = true;
+        return;
+    }
+
+    if (completeness_ != new_completeness)
     {
         bool const recent_change = bytes_downloaded_.during_this_session() != 0U;
         bool const was_running = is_running();
@@ -2253,6 +2264,9 @@ void tr_torrent::on_block_received(tr_block_index_t const block)
             {
                 if (auto* const tor = session->torrents().get(tor_id))
                 {
+                    --tor->n_pending_piece_tests_;
+                    tor->pending_piece_test_bytes_ -= tor->piece_size(piece);
+
                     if (error)
                     {
                         tor->error().set_local_error(
@@ -2283,6 +2297,8 @@ void tr_torrent::on_block_received(tr_block_index_t const block)
     {
         if (has_piece(piece))
         {
+            ++n_pending_piece_tests_;
+            pending_piece_test_bytes_ += piece_size(piece);
             session->local_data.test_piece(id(), piece, on_tested);
         }
     }

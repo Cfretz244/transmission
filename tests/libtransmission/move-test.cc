@@ -164,6 +164,85 @@ TEST_P(IncompleteDirTest, incompleteDir)
     tr_torrentRemove(tor, true);
 }
 
+class CorruptPieceTest : public SessionTest
+{
+protected:
+    static auto constexpr MaxWaitMsec = 3000;
+};
+
+// With hashing asynchronous, every block of a piece can be on disk before
+// its hash is known. The torrent must not report itself complete, and must
+// not count those bytes as complete for trackers, until the check answers.
+TEST_F(CorruptPieceTest, doesNotCompleteOnCorruptPiece)
+{
+    // the test zero_torrent is missing its first piece
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Partial);
+    auto const piece_bytes = tor->piece_size();
+    EXPECT_EQ(piece_bytes, tr_torrentStat(tor).left_until_done);
+
+    auto seen_seed = false;
+    tr_sessionSetCompletenessCallback(
+        session_,
+        [&seen_seed](tr_torrent_id_t const /*tor_id*/, tr_completeness const c, bool const /*was_running*/) noexcept
+        { seen_seed = seen_seed || c != TR_LEECH; });
+
+    struct WriteData
+    {
+        tr_session* session = {};
+        tr_torrent* tor = {};
+        tr_block_index_t block = {};
+        std::unique_ptr<tr::LocalData::BlockData> buf;
+        bool done = {};
+    };
+
+    auto const write_block = [](WriteData* data) noexcept
+    {
+        data->session->local_data.write(
+            data->tor->id(),
+            data->tor->block_info().byte_span_for_block(data->block),
+            std::move(data->buf),
+            [data](tr_torrent_id_t, tr_byte_span_t, tr_error const& error)
+            {
+                data->session->run_in_session_thread(
+                    [data, error]()
+                    {
+                        if (!error)
+                        {
+                            data->tor->on_block_received(data->block);
+                        }
+
+                        data->done = true;
+                    });
+            });
+    };
+
+    // write piece 0, with the last block corrupted
+    auto const [begin, end] = tor->block_span_for_piece(0);
+    for (tr_block_index_t block = begin; block < end; ++block)
+    {
+        auto data = WriteData{};
+        data.session = session_;
+        data.tor = tor;
+        data.block = block;
+        data.buf = std::make_unique<tr::LocalData::BlockData>(tr_block_info::BlockSize);
+        std::fill_n(std::data(*data.buf), tr_block_info::BlockSize, block + 1U == end ? '\x7f' : '\0');
+        session_->run_in_session_thread(write_block, &data);
+        EXPECT_TRUE(waitFor([&data]() { return data.done; }, MaxWaitMsec));
+    }
+
+    // every block is present and the hash check is in flight
+    EXPECT_TRUE(waitFor([tor]() { return !tor->has_pending_piece_tests(); }, MaxWaitMsec));
+
+    // the check failed, so the piece is missing again and nothing was ever reported complete
+    EXPECT_EQ(piece_bytes, tr_torrentStat(tor).left_until_done);
+    EXPECT_EQ(0U, tor->unverified_bytes());
+    EXPECT_FALSE(tor->is_done());
+    EXPECT_FALSE(seen_seed);
+    EXPECT_EQ(piece_bytes, tr_torrentStat(tor).corrupt_ever);
+
+    tr_torrentRemove(tor, true);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     IncompleteDir,
     IncompleteDirTest,
