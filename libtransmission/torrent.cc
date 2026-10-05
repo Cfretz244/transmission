@@ -2522,6 +2522,14 @@ void tr_torrent::on_local_write_done(
     if (!tor->error().is_local_error())
     {
         tor->error().set_local_error(error.message());
+    }
+
+    // A torrent that cannot write is dropping every block it is sent, so
+    // it must stop even when an earlier local error that does not stop
+    // the torrent (a corrupt piece found by an upload check, a failed
+    // piece check) is the one already on display.
+    if (tor->is_running())
+    {
         tr_torrentStop(tor);
     }
 }

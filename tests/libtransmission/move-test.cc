@@ -485,6 +485,55 @@ TEST_F(BlockWrittenTest, blockWhoseWriteFailedIsNotHeld)
     tr_torrentRemove(tor, true);
 }
 
+// A corrupt piece found by an upload check, or a piece check that errors,
+// sets a local error without stopping the torrent. A write that then
+// fails used to be gated on "no local error yet", so the torrent stayed
+// running and dropped every block it was sent (each one re-requested,
+// never written) while telling the tracker it was still downloading.
+TEST_F(BlockWrittenTest, writeErrorStopsTorrentThatAlreadyHasALocalError)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Partial);
+    auto const block = tor->block_span_for_piece(0).begin;
+
+    // the torrent must be running to observe the stop; keep it off the
+    // network first: no trackers, no local peer discovery
+    tr_sessionSetLPDEnabled(session_, false);
+    ASSERT_TRUE(tor->set_announce_list(tr_announce_list{}));
+    tr_torrentStartNow(tor);
+    ASSERT_TRUE(waitFor([tor]() { return tor->is_running(); }, MaxWaitMsec));
+
+    // an earlier local error of the kind that leaves the torrent running
+    auto error_set = false;
+    session_->run_in_session_thread(
+        [tor, &error_set]()
+        {
+            tor->error().set_local_error("Please Verify Local Data! Piece #0 is corrupt.");
+            error_set = true;
+        });
+    ASSERT_TRUE(waitFor([&error_set]() { return error_set; }, MaxWaitMsec));
+    ASSERT_TRUE(tor->error().is_local_error());
+    ASSERT_TRUE(tor->is_running());
+
+    auto const not_a_dir = tr_pathbuf{ sandboxDir(), "/not-a-dir" };
+    createFileWithContents(not_a_dir, "x");
+
+    auto data = WriteData{};
+    data.session = session_;
+    data.tor = tor;
+    data.block = block;
+    data.buf = std::make_unique<tr::LocalData::BlockData>(tr_block_info::BlockSize);
+    std::fill_n(std::data(*data.buf), tr_block_info::BlockSize, '\0');
+    data.bad_dir = tr_pathbuf{ not_a_dir, "/sub" };
+    session_->run_in_session_thread(write_from_departed_peer, &data);
+    EXPECT_TRUE(waitFor([&data]() { return data.done; }, MaxWaitMsec));
+
+    EXPECT_TRUE(data.error);
+    EXPECT_FALSE(tor->has_block(block));
+    EXPECT_TRUE(waitFor([tor]() { return !tor->is_running(); }, MaxWaitMsec));
+
+    tr_torrentRemove(tor, true);
+}
+
 // A piece whose last block lands just before the session closes still has
 // its hash check queued. Closing must let that check finish and record its
 // answer before the torrent's resume file is saved, so the piece is held
