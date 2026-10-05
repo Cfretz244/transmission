@@ -2264,15 +2264,10 @@ using SessionAccessors = std::pair<SessionGetter, SessionSetter>;
 
     map.try_emplace(
         TR_KEY_download_dir_free_space,
-        [](tr_session const& src) -> tr_variant
-        {
-            // TODO(C++23): use std::optional::transform() instead
-            if (auto const space = tr_sys_path_get_capacity(src.downloadDir()))
-            {
-                return space->available;
-            }
-            return -1;
-        },
+        // Served from a cache (refreshed off the session thread) so this hot,
+        // frequently-polled field never blocks the session thread on a statvfs
+        // that a slow download mount can stall for seconds.
+        [](tr_session const& src) -> tr_variant { return src.download_dir_free_space_bytes(); },
         nullptr);
 
     map.try_emplace(

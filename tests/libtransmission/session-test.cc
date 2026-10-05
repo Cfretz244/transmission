@@ -4,6 +4,8 @@
 // License text can be found in the licenses/ folder.
 
 #include <array>
+#include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -11,6 +13,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 
 #include <gtest/gtest.h>
 
@@ -398,6 +401,30 @@ TEST_F(SessionTest, startsOnAConfigDirItCannotLock)
     ASSERT_TRUE(tr_sys_dir_create(dir + "/lock", TR_SYS_DIR_CREATE_PARENTS, 0700));
 
     EXPECT_FALSE(startsOwningConfigDir(dir, quietSettings()));
+}
+
+TEST_F(SessionTest, downloadDirFreeSpaceServedFromCache)
+{
+    auto* const session = session_;
+
+    // The download dir is a real directory, so statvfs succeeds and the cache,
+    // primed at init and refreshed once a second on the session thread, holds a
+    // non-negative byte count. The accessor never calls statvfs itself.
+    auto bytes = int64_t{ -1 };
+    for (auto i = 0; i < 200 && bytes < 0; ++i)
+    {
+        bytes = session->download_dir_free_space_bytes();
+        if (bytes < 0)
+        {
+            std::this_thread::sleep_for(20ms);
+        }
+    }
+    EXPECT_GE(bytes, 0);
+
+    // A download dir the cache has no value for reports -1 rather than a stale
+    // figure for the previous dir: the accessor compares the cached path.
+    session->setDownloadDir(sandboxDir() + "/does-not-exist");
+    EXPECT_EQ(int64_t{ -1 }, session->download_dir_free_space_bytes());
 }
 
 } // namespace tr::test

@@ -14,10 +14,12 @@
 #include <iterator> // for std::back_inserter
 #include <limits> // std::numeric_limits
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <ranges>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -625,6 +627,7 @@ void tr_session::on_now_timer()
     // tr_session upkeep tasks to perform once per second
     tr_timeUpdate(std::chrono::system_clock::to_time_t(now));
     alt_speeds_.check_scheduler();
+    refresh_free_space_cache();
 
     // set the timer to kick again right after (10ms after) the next second
     auto const target_time = std::chrono::time_point_cast<std::chrono::seconds>(now) + 1s + 10ms;
@@ -634,6 +637,50 @@ void tr_session::on_now_timer()
         target_interval += 1s;
     }
     now_timer_->set_interval(std::chrono::duration_cast<std::chrono::milliseconds>(target_interval));
+}
+
+int64_t tr_session::download_dir_free_space_bytes() const
+{
+    auto& cache = *free_space_cache_;
+    auto const lock = std::scoped_lock{ cache.mutex };
+    return cache.path == downloadDir() ? cache.available_bytes : int64_t{ -1 };
+}
+
+void tr_session::refresh_free_space_cache()
+{
+    TR_ASSERT(am_in_session_thread());
+
+    static auto constexpr TtlSecs = time_t{ 5 };
+
+    auto dir = std::string{ downloadDir() };
+    auto cache = free_space_cache_; // a ref the worker keeps alive past our lifetime
+
+    {
+        auto const lock = std::scoped_lock{ cache->mutex };
+        if (cache->refresh_in_flight)
+        {
+            return;
+        }
+        if (cache->path == dir && tr_time() - cache->updated_at < TtlSecs)
+        {
+            return;
+        }
+        cache->refresh_in_flight = true;
+    }
+
+    // Detached, and touching only the shared cache cell: a statvfs stuck on a
+    // wedged mount must not hold up the session thread or session close.
+    std::thread(
+        [cache = std::move(cache), dir = std::move(dir)]() mutable
+        {
+            auto const capacity = tr_sys_path_get_capacity(dir);
+            auto const lock = std::scoped_lock{ cache->mutex };
+            cache->path = std::move(dir);
+            cache->available_bytes = capacity ? static_cast<int64_t>(capacity->available) : int64_t{ -1 };
+            cache->updated_at = tr_time();
+            cache->refresh_in_flight = false;
+        })
+        .detach();
 }
 
 namespace
@@ -769,6 +816,10 @@ void tr_session::initImpl(init_data& data)
     setSettings(settings, true);
 
     tr_utp_init(this);
+
+    // Prime the download-dir free-space cache now so the first RPC poll has a
+    // value instead of -1 while it waits for the first once-a-second refresh.
+    refresh_free_space_cache();
 
     /* cleanup */
     data.done_cv.notify_one();

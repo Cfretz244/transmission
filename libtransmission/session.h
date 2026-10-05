@@ -510,6 +510,12 @@ public:
         settings_.download_dir = dir;
     }
 
+    // Free space on the current download dir in bytes, or -1 if not yet known.
+    // Served from a cache that refresh_free_space_cache() refreshes on a worker
+    // thread, so RPC handlers that report free space never block on a statvfs
+    // that a slow or wedged download mount can stall for seconds.
+    [[nodiscard]] int64_t download_dir_free_space_bytes() const;
+
     // default trackers
     // (trackers to apply automatically to public torrents)
 
@@ -1101,6 +1107,11 @@ private:
     void on_queue_timer();
     void on_save_timer();
 
+    // If the cached download-dir free space is missing or stale, spawn one
+    // detached statvfs off the session thread to refresh it. Called once per
+    // second from on_now_timer(); at most one refresh is in flight at a time.
+    void refresh_free_space_cache();
+
     static void onIncomingPeerConnection(tr_socket_t fd, void* vsession);
 
     friend class tr::test::SessionTest;
@@ -1362,6 +1373,20 @@ private:
     std::unique_ptr<tr::Timer> save_timer_;
 
     std::unique_ptr<tr_verify_worker> verifier_ = std::make_unique<tr_verify_worker>();
+
+    // Cached free space of the download dir. The refreshing worker holds its own
+    // shared_ptr to this, so a statvfs still running when the session is
+    // destroyed writes into an orphaned cache and exits rather than touching a
+    // freed session: session close never waits on it.
+    struct FreeSpaceCache
+    {
+        std::mutex mutex;
+        std::string path; // download dir the cached value is for
+        int64_t available_bytes = -1; // -1 = unknown
+        time_t updated_at = 0;
+        bool refresh_in_flight = false;
+    };
+    std::shared_ptr<FreeSpaceCache> free_space_cache_ = std::make_shared<FreeSpaceCache>();
 
 public:
     std::unique_ptr<tr::Timer> utp_timer;
