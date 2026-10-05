@@ -13,6 +13,8 @@
 
 #include <fmt/format.h>
 
+#include "libtransmission/constants.h" // TrBlockSize
+#include "libtransmission/crypto-utils.h"
 #include "libtransmission/error.h"
 #include "libtransmission/file.h"
 #include "libtransmission/inout.h"
@@ -245,4 +247,32 @@ tr_io_result tr_ioWrite(tr_io_plan const& plan, tr_open_files& open_files, std::
     }
 
     return result;
+}
+
+tr_io_result tr_ioHashSpan(tr_io_plan const& plan, tr_open_files& open_files, tr_sha1_digest_t& setme_hash)
+{
+    auto const n_bytes = plan.byte_span.is_valid() ? plan.byte_span.size() : 0U;
+    if (n_bytes == 0U)
+    {
+        auto result = tr_io_result{};
+        result.error.set_from_errno(EINVAL);
+        return result;
+    }
+
+    auto sha = tr_sha1{};
+    auto buffer = std::array<uint8_t, TrBlockSize>{};
+    for (auto offset = uint64_t{}; offset < n_bytes;)
+    {
+        auto const len = static_cast<size_t>(std::min<uint64_t>(n_bytes - offset, std::size(buffer)));
+        if (auto result = tr_ioRead(plan, open_files, offset, std::span{ std::data(buffer), len }); result.error)
+        {
+            return result;
+        }
+
+        sha.add(std::data(buffer), len);
+        offset += len;
+    }
+
+    setme_hash = sha.finish();
+    return {};
 }

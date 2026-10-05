@@ -849,7 +849,31 @@ bool tr_torrent::is_new_torrent_a_seed()
         }
     }
 
-    return true;
+    // Same-named files of the right size may still hold other content
+    // (e.g. a different release of the same title), and a torrent that
+    // skips the verify step announces `left=0` on the strength of this
+    // check alone. Hash the first piece before believing the metadata.
+    // Nothing is queued for a torrent this new, so the synchronous read
+    // cannot reorder against the LocalData FIFO.
+    return check_piece_now(0U);
+}
+
+bool tr_torrent::check_piece_now(tr_piece_index_t const piece)
+{
+    TR_ASSERT(session->am_in_session_thread());
+    TR_ASSERT(piece < piece_count());
+
+    if (is_piece_checked(piece))
+    {
+        return true;
+    }
+
+    auto hash = tr_sha1_digest_t{};
+    auto const result = tr_ioHashSpan(make_io_plan(block_info().byte_span_for_piece(piece)), session->openFiles(), hash);
+    auto const passed = !result.error && hash == piece_hash(piece);
+    tr_logAddTraceTor(this, fmt::format("[LAZY] tested piece {}, pass=={}", piece, passed));
+    set_piece_is_checked(piece, passed);
+    return passed;
 }
 
 void tr_torrent::on_metainfo_updated()

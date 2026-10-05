@@ -665,6 +665,11 @@ struct tr_torrent
 
     void set_piece_is_checked(tr_piece_index_t piece, bool passed);
 
+    // Hashes `piece` on the calling (session) thread and records the result.
+    // Only for the add-time seed check, where nothing is queued yet; every
+    // other check goes through LocalData::test_piece().
+    bool check_piece_now(tr_piece_index_t piece);
+
     ///
 
     [[nodiscard]] tr_stat stats() const;

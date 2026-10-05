@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "libtransmission/crypto-utils.h" // tr_sha1_digest_t
 #include "libtransmission/error.h"
 #include "libtransmission/types.h"
 
@@ -80,3 +81,9 @@ struct tr_io_result
  * Touches only the filesystem and `open_files`, so it is safe on any thread.
  */
 [[nodiscard]] tr_io_result tr_ioWrite(tr_io_plan const& plan, tr_open_files& open_files, std::span<uint8_t const> writeme);
+
+/**
+ * Reads the plan's whole span and stores its SHA1 digest in `setme_hash`.
+ * Touches only the filesystem and `open_files`, so it is safe on any thread.
+ */
+[[nodiscard]] tr_io_result tr_ioHashSpan(tr_io_plan const& plan, tr_open_files& open_files, tr_sha1_digest_t& setme_hash);

@@ -93,29 +93,7 @@ public:
 
     [[nodiscard]] tr_io_result test_piece(tr_io_plan const& plan, tr_sha1_digest_t& setme_hash) override
     {
-        auto const n_bytes = plan.byte_span.is_valid() ? plan.byte_span.size() : 0U;
-        if (n_bytes == 0U)
-        {
-            return make_result(TR_ERROR_EINVAL);
-        }
-
-        auto sha = tr_sha1{};
-        auto buffer = LocalData::BlockData{};
-        for (auto offset = uint64_t{}; offset < n_bytes;)
-        {
-            auto const len = static_cast<size_t>(std::min<uint64_t>(n_bytes - offset, buffer.capacity()));
-            buffer.resize(len);
-            if (auto result = tr_ioRead(plan, open_files_, offset, std::span{ std::data(buffer), len }); result.error)
-            {
-                return result;
-            }
-
-            sha.add(std::data(buffer), len);
-            offset += len;
-        }
-
-        setme_hash = sha.finish();
-        return {};
+        return tr_ioHashSpan(plan, open_files_, setme_hash);
     }
 
     [[nodiscard]] tr_io_result write(tr_io_plan const& plan, LocalData::BlockData const& data) override
