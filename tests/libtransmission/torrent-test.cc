@@ -8,16 +8,20 @@
 #include <ctime>
 #include <ranges>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <utime.h>
 
+#include <libtransmission/file-utils.h>
 #include <libtransmission/file.h>
+#include <libtransmission/quark.h>
 #include <libtransmission/session.h>
 #include <libtransmission/torrent-metainfo.h>
 #include <libtransmission/torrent.h>
 #include <libtransmission/torrent-ctor.h>
 #include <libtransmission/tr-strbuf.h>
+#include <libtransmission/variant.h>
 
 #include "test-fixtures.h"
 
@@ -226,6 +230,37 @@ TEST_F(TorrentTest, removedTorrentsResumeFileIsDeletedBehindQueuedSaves)
 
     session_->state_writer.flush(resume_file);
     EXPECT_FALSE(tr_sys_path_exists(resume_file));
+}
+
+// State files written by old versions as `name.hash16.suffix` are renamed
+// to `hash.suffix` at add time and their contents used. The legacy names
+// are found by listing each state dir once per session instead of a stat()
+// per add, so a session whose dirs hold no legacy files never looks for them.
+TEST_F(TorrentTest, legacyStateFilesAreMigratedAtAdd)
+{
+    auto* const ctor = zeroTorrentCtor();
+    auto const& metainfo = *tr_ctorGetMetainfo(ctor);
+    auto const hash16 = metainfo.info_hash_string().sv().substr(0, 16);
+    auto const legacy_resume = tr_pathbuf{ session_->resumeDir(), '/', metainfo.name(), '.', hash16, ".resume"sv };
+    auto const legacy_store = tr_pathbuf{ session_->torrentDir(), '/', metainfo.name(), '.', hash16, ".torrent"sv };
+
+    // a legacy resume file carrying a download dir this test can recognise
+    auto const download_dir = tr_pathbuf{ sandboxDir(), "/legacy-destination"sv };
+    auto resume = tr_variant::Map{};
+    resume.try_emplace(TR_KEY_destination, download_dir.sv());
+    ASSERT_TRUE(tr_file_save(legacy_resume, tr_variant_serde::benc().to_string(tr_variant{ std::move(resume) })));
+    ASSERT_TRUE(tr_file_save(legacy_store, ctor->contents()));
+
+    auto* const tor = tr_torrentNew(ctor, nullptr);
+    ASSERT_NE(nullptr, tor);
+    tr_ctorFree(ctor);
+
+    EXPECT_EQ(download_dir.sv(), tor->download_dir().sv());
+    EXPECT_FALSE(tr_sys_path_exists(legacy_resume));
+    EXPECT_TRUE(tr_sys_path_exists(tor->resume_file()));
+    session_->state_writer.flush(tor->store_file());
+    EXPECT_FALSE(tr_sys_path_exists(legacy_store));
+    EXPECT_TRUE(tr_sys_path_exists(tor->store_file()));
 }
 
 // The .torrent file saved at add time is written on the state-writer

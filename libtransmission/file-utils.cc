@@ -23,7 +23,9 @@
 
 using namespace std::literals;
 
-bool tr_file_read(std::string_view filename, std::vector<char>& contents, tr_error* error)
+namespace
+{
+bool file_read_impl(std::string_view filename, std::vector<char>& contents, tr_error* error, bool quiet_if_missing)
 {
     auto const szfilename = tr_pathbuf{ filename };
 
@@ -37,6 +39,11 @@ bool tr_file_read(std::string_view filename, std::vector<char>& contents, tr_err
     auto const info = tr_sys_path_get_info(szfilename, 0, error);
     if (*error)
     {
+        if (quiet_if_missing && error->code() == ENOENT)
+        {
+            return false;
+        }
+
         tr_logAddError(
             fmt::format(
                 fmt::runtime(_("Couldn't read '{path}': {error} ({error_code})")),
@@ -81,6 +88,17 @@ bool tr_file_read(std::string_view filename, std::vector<char>& contents, tr_err
 
     tr_sys_file_close(fd);
     return true;
+}
+} // namespace
+
+bool tr_file_read(std::string_view filename, std::vector<char>& contents, tr_error* error)
+{
+    return file_read_impl(filename, contents, error, false);
+}
+
+bool tr_file_read_if_exists(std::string_view filename, std::vector<char>& contents, tr_error* error)
+{
+    return file_read_impl(filename, contents, error, true);
 }
 
 bool tr_file_save(std::string_view filename, std::string_view contents, tr_error* error)

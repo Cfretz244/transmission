@@ -18,6 +18,10 @@ struct tr_error;
 
 bool tr_file_read(std::string_view filename, std::vector<char>& contents, tr_error* error = nullptr);
 
+// Like tr_file_read(), but a missing file is reported through `error`
+// without being logged, so a caller need not stat() it first.
+bool tr_file_read_if_exists(std::string_view filename, std::vector<char>& contents, tr_error* error = nullptr);
+
 /**
  * Tries to move a file by renaming, and [optionally] if that fails, by copying.
  *

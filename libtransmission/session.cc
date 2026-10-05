@@ -4,6 +4,7 @@
 // License text can be found in the licenses/ folder.
 
 #include <algorithm> // std::partial_sort(), std::min(), std::max()
+#include <cctype> // std::isxdigit()
 #include <condition_variable>
 #include <chrono>
 #include <csignal>
@@ -17,6 +18,7 @@
 #include <mutex>
 #include <optional>
 #include <ranges>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -53,6 +55,7 @@
 #include "libtransmission/session.h"
 #include "libtransmission/string-utils.h"
 #include "libtransmission/timer-ev.h"
+#include "libtransmission/torrent-metainfo.h"
 #include "libtransmission/torrent.h"
 #include "libtransmission/torrent-ctor.h"
 #include "libtransmission/tr-assert.h"
@@ -1655,6 +1658,53 @@ void session_load_torrents(tr_session* session, tr_ctor* ctor, std::promise<size
 }
 } // namespace load_torrents_helpers
 } // namespace
+
+void tr_session::migrate_state_file(
+    std::string_view dir,
+    std::string_view name,
+    std::string_view info_hash_string,
+    std::string_view suffix)
+{
+    // tr_torrent::init() runs on the caller's thread (watchdir, RPC
+    // handler, startup loader) under the session lock; take it here too.
+    auto const lock = unique_lock();
+
+    auto it = legacy_state_files_.find(dir);
+    if (it == std::end(legacy_state_files_))
+    {
+        // A current-format name is `${info_hash}${suffix}`: a 40-hex stem.
+        // Anything else that is not a dotfile may be a legacy
+        // `${name}.${hash16}${suffix}`, so keep it and let the name check
+        // below decide.
+        static auto constexpr is_legacy_name = [](std::string_view basename)
+        {
+            if (!tr_basename_is_not_dotfile(basename))
+            {
+                return false;
+            }
+            auto const stem = basename.substr(0, basename.rfind('.'));
+            return std::size(stem) != sizeof(tr_sha1_digest_t) * 2U ||
+                !std::ranges::all_of(stem, [](unsigned char ch) { return std::isxdigit(ch) != 0; });
+        };
+        auto names = tr_sys_dir_get_files(dir, is_legacy_name);
+        it = legacy_state_files_
+                 .emplace(std::string{ dir }, std::set<std::string, std::less<>>{ std::begin(names), std::end(names) })
+                 .first;
+    }
+
+    auto& names = it->second;
+    if (std::empty(names))
+    {
+        return;
+    }
+
+    auto const legacy_basename = tr_pathbuf{ name, '.', info_hash_string.substr(0, 16), suffix };
+    if (auto const name_it = names.find(legacy_basename.sv()); name_it != std::end(names))
+    {
+        names.erase(name_it);
+        tr_torrent_metainfo::migrate_file(dir, name, info_hash_string, suffix);
+    }
+}
 
 size_t tr_sessionLoadTorrents(tr_session* session, tr_ctor* ctor)
 {

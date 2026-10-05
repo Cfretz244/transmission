@@ -19,9 +19,11 @@
 #include <ctime> // time_t
 #include <future>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -514,6 +516,18 @@ public:
     {
         return resume_dir_;
     }
+
+    // Rename a `name.hash16.suffix` state file left in `dir` by an old
+    // version to its `hash.suffix` name. Only old versions write the legacy
+    // names, so each state dir is listed once per session and the per-add
+    // stat()s on the legacy names are skipped when there are none; a legacy
+    // file dropped into a live session's dir is picked up at the next start.
+    // Takes the session lock.
+    void migrate_state_file(
+        std::string_view dir,
+        std::string_view name,
+        std::string_view info_hash_string,
+        std::string_view suffix);
 
     [[nodiscard]] constexpr auto torrentsLoadedTime() const noexcept
     {
@@ -1244,6 +1258,11 @@ private:
     std::string const resume_dir_;
     std::string const torrent_dir_;
     std::string const blocklist_dir_;
+
+    // Legacy-named basenames found in each state dir, by dir. See
+    // migrate_state_file(). A dir is scanned on its first lookup. Guarded by
+    // the session lock, since torrents are added on the caller's thread.
+    std::map<std::string, std::set<std::string, std::less<>>, std::less<>> legacy_state_files_;
 
     std::unique_ptr<tr_session_thread> const session_thread_;
 

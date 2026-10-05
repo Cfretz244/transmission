@@ -1034,7 +1034,7 @@ void tr_torrent::init(tr_ctor const& ctor)
         auto resume_helper = ResumeHelper{ *this };
         loaded = tr_resume::load(this, resume_helper, tr_resume::All, ctor);
         set_dirty(was_dirty);
-        tr_torrent_metainfo::migrate_file(session->torrentDir(), name(), info_hash_string(), ".torrent"sv);
+        session->migrate_state_file(session->torrentDir(), name(), info_hash_string(), ".torrent"sv);
     }
 
     completeness_ = completion_.status();

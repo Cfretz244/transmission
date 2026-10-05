@@ -629,7 +629,7 @@ tr_resume::fields_t load_from_file(tr_torrent* tor, tr_torrent::ResumeHelper& he
 {
     TR_ASSERT(tr_isTorrent(tor));
 
-    tr_torrent_metainfo::migrate_file(tor->session->resumeDir(), tor->name(), tor->info_hash_string(), ".resume"sv);
+    tor->session->migrate_state_file(tor->session->resumeDir(), tor->name(), tor->info_hash_string(), ".resume"sv);
 
     auto const filename = tor->resume_file();
 
@@ -638,7 +638,7 @@ tr_resume::fields_t load_from_file(tr_torrent* tor, tr_torrent::ResumeHelper& he
     tor->session->state_writer.flush(filename);
 
     auto benc = std::vector<char>{};
-    if (!tr_sys_path_exists(filename) || !tr_file_read(filename, benc))
+    if (!tr_file_read_if_exists(filename, benc))
     {
         return {};
     }
