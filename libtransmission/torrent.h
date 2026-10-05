@@ -626,10 +626,6 @@ struct tr_torrent
         return metainfo_.info_dict_offset();
     }
 
-    /// METAINFO - PIECE CHECKSUMS
-
-    [[nodiscard]] bool ensure_piece_is_checked(tr_piece_index_t piece);
-
     /// METAINFO - MAGNET
 
     void maybe_start_metadata_transfer(int64_t size) noexcept;
@@ -641,6 +637,15 @@ struct tr_torrent
     [[nodiscard]] std::optional<int64_t> get_next_metadata_request(time_t now) noexcept;
 
     [[nodiscard]] double get_metadata_percent() const noexcept;
+
+    ///
+
+    [[nodiscard]] constexpr bool is_piece_checked(tr_piece_index_t piece) const
+    {
+        return checked_pieces_.test(piece);
+    }
+
+    void set_piece_is_checked(tr_piece_index_t piece, bool passed);
 
     ///
 
@@ -1187,13 +1192,6 @@ private:
         return n_secs;
     }
 
-    [[nodiscard]] constexpr bool is_piece_checked(tr_piece_index_t piece) const
-    {
-        return checked_pieces_.test(piece);
-    }
-
-    [[nodiscard]] bool check_piece(tr_piece_index_t piece) const;
-
     [[nodiscard]] constexpr std::optional<uint16_t> effective_idle_limit_minutes() const noexcept
     {
         auto const mode = idle_limit_mode();
@@ -1336,8 +1334,6 @@ private:
     [[nodiscard]] bool use_new_metainfo(tr_error* error);
 
     void update_file_path(tr_file_index_t file, std::optional<bool> has_file) const;
-
-    void set_location_in_session_thread(std::string_view path, bool move_from_old_path, int volatile* setme_state);
 
     void rename_path_in_session_thread(
         std::string_view oldpath,

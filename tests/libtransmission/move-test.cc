@@ -11,11 +11,12 @@
 
 #include <gtest/gtest.h>
 
+#include <libtransmission/peer-common.h>
 #include <libtransmission/transmission.h>
 
 #include <libtransmission/block-info.h>
 #include <libtransmission/file.h> // tr_sys_path_*()
-#include <libtransmission/inout.h>
+#include <libtransmission/local-data.h>
 #include <libtransmission/quark.h>
 #include <libtransmission/torrent-files.h>
 #include <libtransmission/torrent.h>
@@ -82,19 +83,30 @@ TEST_P(IncompleteDirTest, incompleteDir)
         tr_torrent* tor = {};
         tr_block_index_t block = {};
         tr_piece_index_t pieceIndex = {};
-        std::vector<uint8_t> buf;
+        std::unique_ptr<tr::LocalData::BlockData> buf;
         bool done = {};
     };
 
     auto const test_incomplete_dir_threadfunc = [](TestIncompleteDirData* data) noexcept
     {
-        auto& tor = *data->tor;
-        if (tr_ioWrite(tor, data->session->openFiles(), tor.block_loc(data->block), data->buf) == 0)
-        {
-            data->tor->on_block_received(data->block);
-        }
+        auto const event = tr_peer_event::GotBlock(data->tor->block_info(), data->block);
+        data->session->local_data.write(
+            data->tor->id(),
+            data->tor->block_info().byte_span_for_block(data->block),
+            std::move(data->buf),
+            [data, event](tr_torrent_id_t, tr_byte_span_t, tr_error const& error)
+            {
+                data->session->run_in_session_thread(
+                    [data, event, error]()
+                    {
+                        if (!error)
+                        {
+                            data->tor->on_block_received(data->block);
+                        }
 
-        data->done = true;
+                        data->done = true;
+                    });
+            });
     };
 
     // now finish writing it
@@ -107,8 +119,8 @@ TEST_P(IncompleteDirTest, incompleteDir)
 
         for (tr_block_index_t block_index = begin; block_index < end; ++block_index)
         {
-            data.buf.resize(tr_block_info::BlockSize);
-            std::ranges::fill(data.buf, '\0');
+            data.buf = std::make_unique<tr::LocalData::BlockData>(tr_block_info::BlockSize);
+            std::fill_n(std::data(*data.buf), tr_block_info::BlockSize, '\0');
             data.block = block_index;
             data.done = false;
             session_->run_in_session_thread(test_incomplete_dir_threadfunc, &data);
@@ -131,12 +143,22 @@ TEST_P(IncompleteDirTest, incompleteDir)
     EXPECT_TRUE(waitFor(test, MaxWaitMsec));
     EXPECT_EQ(TR_SEED, completeness);
 
+    // completion is announced before the move out of the incomplete dir
+    // finishes, so wait for every file to land in the download dir
     auto const n = tr_torrentFileCount(tor);
-    for (tr_file_index_t i = 0; i < n; ++i)
+    auto const all_files_moved = [tor, n, &download_dir]()
     {
-        auto const expected = tr_pathbuf{ download_dir, '/', tr_torrentFile(tor, i).name };
-        EXPECT_EQ(expected, tr_torrentFindFile(tor, i));
-    }
+        for (tr_file_index_t i = 0; i < n; ++i)
+        {
+            auto const expected = tr_pathbuf{ download_dir, '/', tr_torrentFile(tor, i).name };
+            if (expected != tr_torrentFindFile(tor, i))
+            {
+                return false;
+            }
+        }
+        return true;
+    };
+    EXPECT_TRUE(waitFor(all_files_moved, MaxWaitMsec));
 
     // cleanup
     tr_torrentRemove(tor, true);

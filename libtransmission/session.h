@@ -432,6 +432,11 @@ public:
         return session_thread_->event_base();
     }
 
+    [[nodiscard]] constexpr auto& openFiles() noexcept
+    {
+        return open_files_;
+    }
+
     [[nodiscard]] constexpr tr_torrents& torrents()
     {
         return torrents_;
@@ -645,16 +650,6 @@ public:
     // bandwidth
 
     [[nodiscard]] tr_bandwidth& getBandwidthGroup(std::string_view name);
-
-    //
-
-    [[nodiscard]] constexpr auto& openFiles() noexcept
-    {
-        return open_files_;
-    }
-
-    void close_torrent_files(tr_torrent_id_t tor_id) noexcept;
-    void close_torrent_file(tr_torrent const& tor, tr_file_index_t file_num) noexcept;
 
     // announce ip
 
@@ -1264,8 +1259,6 @@ private:
 
     tr_session_id session_id_;
 
-    tr_open_files open_files_;
-
     tr::Blocklists blocklists_;
 
     QueueMediator torrent_queue_mediator_{ *this };
@@ -1304,12 +1297,16 @@ public:
     struct struct_utp_context* utp_context = nullptr;
 
 private:
+    tr_open_files open_files_;
+
     // depends-on: open_files_
     tr_torrents torrents_;
 
 public:
-    // depends-on: open_files_, torrents_
-    tr::LocalData local_data{ torrents_, open_files_ };
+    // depends-on: open_files_, torrents_, session_thread_
+    tr::LocalData local_data{ torrents_,
+                              open_files_,
+                              [this](std::function<void()> func) { run_in_session_thread(std::move(func)); } };
 
 private:
     // depends-on: settings_, session_thread_, timer_maker_, web_
@@ -1320,6 +1317,7 @@ private:
     WebMediator web_mediator_{ this };
     std::unique_ptr<tr_web> web_ = tr_web::create(this->web_mediator_);
 
+private:
     // depends-on: timer_maker_, blocklists_, top_bandwidth_, utp_context, torrents_, web_
     std::unique_ptr<struct tr_peerMgr, void (*)(struct tr_peerMgr*)> peer_mgr_;
 

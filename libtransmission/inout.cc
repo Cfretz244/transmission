@@ -195,43 +195,6 @@ void write_bytes(
                 fmt::arg("error_code", error.code())));
     }
 }
-
-std::optional<tr_sha1_digest_t> recalculate_hash(tr_torrent const& tor, tr_piece_index_t const piece)
-{
-    TR_ASSERT(piece < tor.piece_count());
-
-    auto sha = tr_sha1{};
-    auto buffer = std::array<uint8_t, tr_block_info::BlockSize>{};
-    auto& open_files = tor.session->openFiles();
-
-    auto const [begin_byte, end_byte] = tor.block_info().byte_span_for_piece(piece);
-    auto const [begin_block, end_block] = tor.block_span_for_piece(piece);
-    [[maybe_unused]] auto n_bytes_checked = size_t{};
-    for (auto block = begin_block; block < end_block; ++block)
-    {
-        auto const block_loc = tor.block_loc(block);
-        auto const block_len = tor.block_size(block);
-        auto contents = std::span{ std::data(buffer), block_len };
-        if (auto const success = tr_ioRead(tor, open_files, block_loc, contents) == 0; !success)
-        {
-            return {};
-        }
-
-        // Handle edge cases where blocks aren't perfectly aligned on piece boundaries.
-        // `std::max` ensures we don't start hashing before the piece begins (for the first block).
-        // `std::min` ensures we don't hash past the end of the piece (for the last block).
-        auto const start = std::max(begin_byte, block_loc.byte);
-        auto const end = std::min(end_byte, block_loc.byte + block_len);
-        auto const piece_data = contents.subspan(start - block_loc.byte, static_cast<size_t>(end - start));
-
-        sha.add(std::data(piece_data), std::size(piece_data));
-        n_bytes_checked += std::size(piece_data);
-    }
-
-    TR_ASSERT(tor.piece_size(piece) == n_bytes_checked);
-    return sha.finish();
-}
-
 } // namespace
 
 tr_error_code_t tr_ioRead(
@@ -241,6 +204,7 @@ tr_error_code_t tr_ioRead(
     std::span<uint8_t> const setme)
 {
     auto error = tr_error{};
+
     if (loc.piece >= tor.piece_count())
     {
         error.set_from_errno(EINVAL);
@@ -269,6 +233,7 @@ tr_error_code_t tr_ioWrite(
     std::span<uint8_t const> const writeme)
 {
     auto error = tr_error{};
+
     if (loc.piece >= tor.piece_count())
     {
         error.set_from_errno(EINVAL);
@@ -296,10 +261,4 @@ tr_error_code_t tr_ioWrite(
     }
 
     return error.code();
-}
-
-bool tr_ioTestPiece(tr_torrent const& tor, tr_piece_index_t const piece)
-{
-    auto const hash = recalculate_hash(tor, piece);
-    return hash && *hash == tor.piece_hash(piece);
 }

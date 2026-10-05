@@ -200,6 +200,8 @@ using tr_peer_callback_generic = void (*)(tr_peer* peer, tr_peer_event const& ev
  * @see tr_peer_info
  * @see tr_peerMsgs
  */
+struct tr_torrent;
+
 struct tr_peer
 {
     using Speed = tr::Values::Speed;

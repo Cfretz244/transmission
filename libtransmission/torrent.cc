@@ -713,7 +713,7 @@ void tr_torrent::stop_now()
     stopped_(this);
     session->announcer_->stopTorrent(this);
 
-    session->close_torrent_files(id());
+    session->local_data.close_torrent(id());
 
     if (!is_deleting_)
     {
@@ -723,6 +723,7 @@ void tr_torrent::stop_now()
     set_is_queued(false);
 }
 
+// FIXME: this needs to be moved into session->local_data()
 // By-value: arguments are moved into the session-thread work item.
 void tr_torrentRemoveInSessionThread(
     tr_torrent* tor,
@@ -734,7 +735,7 @@ void tr_torrentRemoveInSessionThread(
     if (delete_flag && tor->has_metainfo())
     {
         // ensure the files are all closed and idle before moving
-        tor->session->close_torrent_files(tor->id());
+        tor->session->local_data.close_torrent(tor->id());
         tor->session->verify_remove(tor);
 
         if (!remove_func)
@@ -846,8 +847,7 @@ bool tr_torrent::is_new_torrent_a_seed()
         }
     }
 
-    // check the first piece
-    return ensure_piece_is_checked(0);
+    return true;
 }
 
 void tr_torrent::on_metainfo_updated()
@@ -1086,55 +1086,6 @@ tr_torrent* tr_torrentNew(tr_ctor* ctor, tr_torrent** setme_duplicate_of)
 
 // --- Location
 
-void tr_torrent::set_location_in_session_thread(std::string_view const path, bool move_from_old_path, int volatile* setme_state)
-{
-    TR_ASSERT(session->am_in_session_thread());
-
-    auto ok = true;
-    if (move_from_old_path)
-    {
-        if (setme_state != nullptr)
-        {
-            *setme_state = TR_LOC_MOVING;
-        }
-
-        // ensure the files are all closed and idle before moving
-        session->close_torrent_files(id());
-        session->verify_remove(this);
-
-        auto error = tr_error{};
-        ok = files().move(current_dir(), path, name(), &error);
-        if (error)
-        {
-            this->error().set_local_error(
-                fmt::format(
-                    fmt::runtime(_("Couldn't move '{old_path}' to '{path}': {error} ({error_code})")),
-                    fmt::arg("old_path", current_dir()),
-                    fmt::arg("path", path),
-                    fmt::arg("error", error.message()),
-                    fmt::arg("error_code", error.code())));
-            tr_torrentStop(this);
-        }
-    }
-
-    // tell the torrent where the files are
-    if (ok)
-    {
-        set_download_dir(path);
-
-        if (move_from_old_path)
-        {
-            incomplete_dir_.clear();
-            current_dir_ = download_dir();
-        }
-    }
-
-    if (setme_state != nullptr)
-    {
-        *setme_state = ok ? TR_LOC_DONE : TR_LOC_ERROR;
-    }
-}
-
 namespace
 {
 namespace location_helpers
@@ -1165,8 +1116,77 @@ void tr_torrent::set_location(std::string_view location, bool move_from_old_path
         *setme_state = TR_LOC_MOVING;
     }
 
-    session->run_in_session_thread([this, loc = std::string(location), move_from_old_path, setme_state]()
-                                   { set_location_in_session_thread(loc, move_from_old_path, setme_state); });
+    auto const tor_id = id();
+
+    session->run_in_session_thread(
+        [session = this->session, tor_id, path = std::string(location), move_from_old_path, setme_state]() mutable
+        {
+            auto* const tor = session->torrents().get(tor_id);
+            if (tor == nullptr)
+            {
+                return;
+            }
+
+            if (!move_from_old_path)
+            {
+                tor->set_download_dir(path);
+                if (setme_state != nullptr)
+                {
+                    *setme_state = TR_LOC_DONE;
+                }
+
+                return;
+            }
+
+            session->verify_remove(tor);
+
+            auto old_path = std::string{ tor->current_dir() };
+            auto const top_name = std::string{ tor->name() };
+            session->local_data.move(
+                tor_id,
+                old_path,
+                path,
+                top_name,
+                [session, tor_id, path = std::move(path), old_path = std::move(old_path), setme_state](
+                    tr_torrent_id_t,
+                    tr_error const& error) mutable
+                {
+                    auto lock = session->unique_lock();
+                    auto* const tor = session->torrents().get(tor_id);
+                    if (!tor)
+                    {
+                        return;
+                    }
+
+                    if (error)
+                    {
+                        tor->error().set_local_error(
+                            fmt::format(
+                                fmt::runtime(_("Couldn't move '{old_path}' to '{path}': {error} ({error_code})")),
+                                fmt::arg("old_path", old_path),
+                                fmt::arg("path", path),
+                                fmt::arg("error", error.message()),
+                                fmt::arg("error_code", error.code())));
+                        tr_torrentStop(tor);
+
+                        if (setme_state != nullptr)
+                        {
+                            *setme_state = TR_LOC_ERROR;
+                        }
+
+                        return;
+                    }
+
+                    tor->set_download_dir(path);
+                    tor->incomplete_dir_.clear();
+                    tor->current_dir_ = tor->download_dir();
+
+                    if (setme_state != nullptr)
+                    {
+                        *setme_state = TR_LOC_DONE;
+                    }
+                });
+        });
 }
 
 void tr_torrentSetLocation(tr_torrent* tor, char const* location, bool move_from_old_path, int volatile* setme_state)
@@ -1853,7 +1873,7 @@ void tr_torrent::recheck_completeness()
 
         if (is_done())
         {
-            session->close_torrent_files(id());
+            session->local_data.close_torrent(id());
 
             if (recent_change)
             {
@@ -2011,15 +2031,6 @@ void tr_torrent::set_file_priorities(tr_file_index_t const* files, tr_file_index
 
 // ---
 
-bool tr_torrent::check_piece(tr_piece_index_t const piece) const
-{
-    auto const pass = tr_ioTestPiece(*this, piece);
-    tr_logAddTraceTor(this, fmt::format("[LAZY] tr_torrent.checkPiece tested piece {}, pass=={}", piece, pass));
-    return pass;
-}
-
-// ---
-
 bool tr_torrent::set_announce_list(std::string_view announce_list_str)
 {
     auto ann = tr_announce_list{};
@@ -2171,19 +2182,19 @@ std::string_view tr_torrent::primary_mime_type() const
 
 // ---
 
-void tr_torrent::on_file_completed(tr_file_index_t const file)
+void tr_torrent::on_file_completed(tr_file_index_t const file_num)
 {
     /* close the file so that we can reopen in read-only mode as needed */
-    session->close_torrent_file(*this, file);
+    session->local_data.close_file(id(), file_num);
 
     /* now that the file is complete and closed, we can start watching its
      * mtime timestamp for changes to know if we need to reverify pieces */
-    file_mtimes_[file] = tr_time();
+    file_mtimes_[file_num] = tr_time();
 
     /* if the torrent's current filename isn't the same as the one in the
      * metadata -- for example, if it had the ".part" suffix appended to
      * it until now -- then rename it to match the one in the metadata */
-    update_file_path(file, true);
+    update_file_path(file_num, true);
 }
 
 void tr_torrent::on_piece_completed(tr_piece_index_t const piece)
@@ -2216,7 +2227,7 @@ void tr_torrent::on_piece_failed(tr_piece_index_t const piece)
 
 void tr_torrent::on_block_received(tr_block_index_t const block)
 {
-    TR_ASSERT(session->am_in_session_thread());
+    TR_ASSERT(this->session->am_in_session_thread());
 
     if (has_block(block))
     {
@@ -2229,23 +2240,48 @@ void tr_torrent::on_block_received(tr_block_index_t const block)
 
     completion_.add_block(block);
 
+    auto const on_tested = [session = this->session](
+                               tr_torrent_id_t tor_id,
+                               tr_piece_index_t piece,
+                               tr_error const& error,
+                               std::optional<tr_sha1_digest_t> hash)
+    {
+        session->run_in_session_thread(
+            [session, tor_id, piece, error, hash = std::move(hash)]()
+            {
+                if (auto* const tor = session->torrents().get(tor_id))
+                {
+                    if (error)
+                    {
+                        tor->error().set_local_error(
+                            fmt::format(
+                                fmt::runtime(_("Couldn't verify piece #{piece}: {error} ({error_code})")),
+                                fmt::arg("piece", piece),
+                                fmt::arg("error", error.message()),
+                                fmt::arg("error_code", error.code())));
+                        return;
+                    }
+
+                    if (hash == tor->piece_hash(piece))
+                    {
+                        tor->on_piece_completed(piece);
+                    }
+                    else
+                    {
+                        tor->on_piece_failed(piece);
+                    }
+                }
+            });
+    };
+
     auto const block_loc = this->block_loc(block);
     auto const first_piece = block_loc.piece;
     auto const last_piece = byte_loc(block_loc.byte + block_size(block) - 1).piece;
     for (auto piece = first_piece; piece <= last_piece; ++piece)
     {
-        if (!has_piece(piece))
+        if (has_piece(piece))
         {
-            continue;
-        }
-
-        if (check_piece(piece))
-        {
-            on_piece_completed(piece);
-        }
-        else
-        {
-            on_piece_failed(piece);
+            session->local_data.test_piece(id(), piece, on_tested);
         }
     }
 }
@@ -2554,21 +2590,11 @@ void tr_torrent::mark_changed()
     this->bump_date_changed(tr_time());
 }
 
-[[nodiscard]] bool tr_torrent::ensure_piece_is_checked(tr_piece_index_t piece)
+void tr_torrent::set_piece_is_checked(tr_piece_index_t const piece, bool const passed)
 {
-    TR_ASSERT(piece < this->piece_count());
-
-    if (is_piece_checked(piece))
-    {
-        return true;
-    }
-
-    bool const checked = check_piece(piece);
     mark_changed();
     set_dirty();
-
-    checked_pieces_.set(piece, checked);
-    return checked;
+    checked_pieces_.set(piece, passed);
 }
 
 // --- RESUME HELPER
