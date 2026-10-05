@@ -11,6 +11,7 @@
 #include <cstddef> // size_t
 #include <ctime>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -84,10 +85,25 @@ public:
         }
     };
 
+    // Name resolution for the bootstrap hosts. A lookup can take seconds
+    // when no resolver answers, so tr_dht calls this from a worker thread
+    // that may outlive both the tr_dht and its mediator: an implementation
+    // must stand on its own.
+    class Resolver
+    {
+    public:
+        virtual ~Resolver() = default;
+
+        [[nodiscard]] virtual std::vector<tr_socket_address> resolve(std::string const& host, tr_port port) = 0;
+    };
+
     class Mediator
     {
     public:
         virtual ~Mediator() = default;
+
+        // The default resolves with getaddrinfo().
+        [[nodiscard]] virtual std::shared_ptr<Resolver> resolver();
 
         [[nodiscard]] virtual std::vector<tr_torrent_id_t> torrents_allowing_dht() const = 0;
         [[nodiscard]] virtual tr_sha1_digest_t torrent_info_hash(tr_torrent_id_t) const = 0;

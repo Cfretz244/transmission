@@ -11,12 +11,15 @@
 #include <ctime>
 #include <deque>
 #include <fstream>
+#include <future>
 #include <map>
 #include <memory>
+#include <optional>
 #include <ranges>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple> // std::tie()
 #include <utility>
 #include <vector>
@@ -118,6 +121,61 @@ constexpr std::array<std::pair<char const*, uint16_t>, 3> const DefaultBootstrap
     { "dht.libtorrent.org", 25401 },
 } };
 
+// how often the bootstrap timer looks for the resolver's answer while it
+// has no other node to ping
+auto constexpr LookupPollInterval = 250ms;
+
+class GetaddrinfoResolver final : public tr_dht::Resolver
+{
+public:
+    [[nodiscard]] std::vector<tr_socket_address> resolve(std::string const& host, tr_port port_in) override
+    {
+        auto hints = addrinfo{};
+        hints.ai_socktype = SOCK_DGRAM;
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_protocol = 0;
+        hints.ai_flags = 0;
+
+        auto const port_str = fmt::format("{:d}", port_in.host());
+        addrinfo* info = nullptr;
+        if (int const rc = getaddrinfo(host.c_str(), port_str.c_str(), &hints, &info); rc != 0)
+        {
+            tr_logAddWarn(
+                fmt::format(
+                    fmt::runtime(_("Couldn't look up '{address}:{port}': {error} ({error_code})")),
+                    fmt::arg("address", host),
+                    fmt::arg("port", port_in.host()),
+                    fmt::arg("error", gai_strerror(rc)),
+                    fmt::arg("error_code", rc)));
+            return {};
+        }
+
+        auto ret = std::vector<tr_socket_address>{};
+        for (auto* infop = info; infop != nullptr; infop = infop->ai_next)
+        {
+            if (auto addrport = tr_socket_address::from_sockaddr(infop->ai_addr); addrport)
+            {
+                ret.emplace_back(*addrport);
+            }
+        }
+
+        freeaddrinfo(info);
+        return ret;
+    }
+};
+
+template<typename T>
+bool is_future_ready(std::future<T> const& future)
+{
+    return future.wait_for(0s) == std::future_status::ready;
+}
+
+} // namespace
+
+std::shared_ptr<tr_dht::Resolver> tr_dht::Mediator::resolver()
+{
+    static auto const resolver = std::make_shared<GetaddrinfoResolver>();
+    return resolver;
 }
 
 class tr_dht_impl final : public tr_dht
@@ -152,11 +210,26 @@ public:
         // init state from scratch, or load from state file if it exists
         init_state(state_filename_);
 
-        get_nodes_from_bootstrap_file(tr_pathbuf{ mediator_.config_dir(), "/dht.bootstrap"sv }, bootstrap_queue_);
-        for (auto const& [host, port] : DefaultBootstraps)
-        {
-            get_nodes_from_name(host, tr_port::from_host(port), bootstrap_queue_);
-        }
+        // The bootstrap names resolve on a worker; the lookup can take
+        // seconds, and the timer appends the answer to the queue once it
+        // is in. The worker owns everything it touches, so it may outlive
+        // this object.
+        auto task = std::packaged_task<Nodes()>{
+            [resolver = mediator_.resolver(),
+             filename = std::string{ tr_pathbuf{ mediator_.config_dir(), "/dht.bootstrap"sv } }]()
+            {
+                auto nodes = Nodes{};
+                get_nodes_from_bootstrap_file(filename, *resolver, nodes);
+                for (auto const& [host, port] : DefaultBootstraps)
+                {
+                    get_nodes_from_name(host, tr_port::from_host(port), *resolver, nodes);
+                }
+                return nodes;
+            }
+        };
+        bootstrap_lookup_ = task.get_future();
+        std::thread{ std::move(task) }.detach();
+
         bootstrap_timer_->start_single_shot(100ms);
 
         mediator_.api().init(static_cast<int>(udp4_socket_), static_cast<int>(udp6_socket_), std::data(id_), nullptr);
@@ -311,10 +384,28 @@ private:
 
     void on_bootstrap_timer()
     {
+        if (bootstrap_lookup_ && is_future_ready(*bootstrap_lookup_))
+        {
+            auto const nodes = bootstrap_lookup_->get();
+            bootstrap_lookup_.reset();
+            bootstrap_queue_.insert(std::end(bootstrap_queue_), std::begin(nodes), std::end(nodes));
+        }
+
         // Since we don't want to abuse our bootstrap nodes,
         // we don't ping them if the DHT is in a good state.
-        if (is_ready() || std::empty(bootstrap_queue_))
+        if (is_ready())
         {
+            return;
+        }
+
+        if (std::empty(bootstrap_queue_))
+        {
+            if (bootstrap_lookup_)
+            {
+                // nothing to ping until the names resolve
+                bootstrap_timer_->start_single_shot(LookupPollInterval);
+            }
+
             return;
         }
 
@@ -544,7 +635,7 @@ private:
 
     ///
 
-    static void get_nodes_from_bootstrap_file(std::string_view filename, Nodes& nodes)
+    static void get_nodes_from_bootstrap_file(std::string_view filename, Resolver& resolver, Nodes& nodes)
     {
         auto in = std::ifstream{ std::string{ filename } };
         if (!in.is_open())
@@ -571,42 +662,17 @@ private:
             }
             else
             {
-                get_nodes_from_name(addrstr.c_str(), tr_port::from_host(hport), nodes);
+                get_nodes_from_name(addrstr, tr_port::from_host(hport), resolver, nodes);
             }
         }
     }
 
-    static void get_nodes_from_name(char const* name, tr_port port_in, Nodes& nodes)
+    static void get_nodes_from_name(std::string const& name, tr_port port, Resolver& resolver, Nodes& nodes)
     {
-        auto hints = addrinfo{};
-        hints.ai_socktype = SOCK_DGRAM;
-        hints.ai_family = AF_UNSPEC;
-        hints.ai_protocol = 0;
-        hints.ai_flags = 0;
-
-        auto const port_str = fmt::format("{:d}", port_in.host());
-        addrinfo* info = nullptr;
-        if (int const rc = getaddrinfo(name, port_str.c_str(), &hints, &info); rc != 0)
+        for (auto const& node : resolver.resolve(name, port))
         {
-            tr_logAddWarn(
-                fmt::format(
-                    fmt::runtime(_("Couldn't look up '{address}:{port}': {error} ({error_code})")),
-                    fmt::arg("address", name),
-                    fmt::arg("port", port_in.host()),
-                    fmt::arg("error", gai_strerror(rc)),
-                    fmt::arg("error_code", rc)));
-            return;
+            nodes.emplace_back(node);
         }
-
-        for (auto* infop = info; infop != nullptr; infop = infop->ai_next)
-        {
-            if (auto addrport = tr_socket_address::from_sockaddr(infop->ai_addr); addrport)
-            {
-                nodes.emplace_back(*addrport);
-            }
-        }
-
-        freeaddrinfo(info);
     }
 
     ///
@@ -626,6 +692,9 @@ private:
 
     Nodes bootstrap_queue_;
     size_t n_bootstrapped_ = 0;
+
+    // pending while the bootstrap names are still resolving
+    std::optional<std::future<Nodes>> bootstrap_lookup_;
 
     struct AnnounceInfo
     {

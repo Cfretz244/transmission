@@ -7,6 +7,7 @@
 #include <array>
 #include <cassert>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef> // size_t, std::byte
 #include <ctime> // time(), time_t
 #include <fstream>
@@ -14,6 +15,7 @@
 #include <iterator> // std::back_inserter
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -330,12 +332,78 @@ protected:
         EvTimerMaker real_timer_maker_;
     };
 
+    // Answers numeric hosts itself and names from `answers_`. The gate
+    // holds every lookup, the way a resolver that never answers would;
+    // the test opens it when it wants the lookup to finish.
+    class MockResolver final : public tr_dht::Resolver
+    {
+    public:
+        [[nodiscard]] std::vector<tr_socket_address> resolve(std::string const& host, tr_port port) override
+        {
+            auto lock = std::unique_lock{ mutex_ };
+            ++n_lookups_;
+            cv_.wait(lock, [this] { return gate_open_; });
+            ++n_answered_;
+
+            if (auto const addr = tr_address::from_string(host); addr)
+            {
+                return { tr_socket_address{ *addr, port } };
+            }
+
+            if (auto const iter = answers_.find(host); iter != std::end(answers_))
+            {
+                return { tr_socket_address{ iter->second, port } };
+            }
+
+            return {};
+        }
+
+        void close_gate()
+        {
+            auto const lock = std::scoped_lock{ mutex_ };
+            gate_open_ = false;
+        }
+
+        void open_gate()
+        {
+            auto const lock = std::scoped_lock{ mutex_ };
+            gate_open_ = true;
+            cv_.notify_all();
+        }
+
+        [[nodiscard]] size_t n_lookups()
+        {
+            auto const lock = std::scoped_lock{ mutex_ };
+            return n_lookups_;
+        }
+
+        [[nodiscard]] size_t n_answered()
+        {
+            auto const lock = std::scoped_lock{ mutex_ };
+            return n_answered_;
+        }
+
+        std::map<std::string, tr_address> answers_;
+
+    private:
+        std::mutex mutex_;
+        std::condition_variable cv_;
+        bool gate_open_ = true;
+        size_t n_lookups_ = 0;
+        size_t n_answered_ = 0;
+    };
+
     class MockMediator final : public tr_dht::Mediator
     {
     public:
         explicit MockMediator(struct event_base* event_base)
             : mock_timer_maker_{ event_base }
         {
+        }
+
+        [[nodiscard]] std::shared_ptr<tr_dht::Resolver> resolver() override
+        {
+            return mock_resolver_;
         }
 
         [[nodiscard]] std::vector<tr_torrent_id_t> torrents_allowing_dht() const override
@@ -377,6 +445,7 @@ protected:
         std::map<tr_torrent_id_t, tr_sha1_digest_t> info_hashes_;
         MockDht mock_dht_;
         MockTimerMaker mock_timer_maker_;
+        std::shared_ptr<MockResolver> mock_resolver_ = std::make_shared<MockResolver>();
     };
 
     void SetUp() override
@@ -605,6 +674,77 @@ TEST_F(DhtTest, usesBootstrapFile)
     EXPECT_EQ(expected.address(), actual_addrport.address());
     EXPECT_EQ(expected.port(), actual_addrport.port());
     EXPECT_EQ(expected.display_name(), actual_addrport.display_name());
+}
+
+TEST_F(DhtTest, bootstrapsFromNamesWithoutWaitingForTheResolver)
+{
+    static auto constexpr BootstrapName = "dht.transmissionbt.com"sv;
+    auto const bootstrap_addr = tr_address::from_string("91.121.74.28");
+    ASSERT_TRUE(bootstrap_addr.has_value());
+
+    auto mediator = MockMediator{ event_base_ };
+    mediator.config_dir_ = sandboxDir();
+    auto& resolver = *mediator.mock_resolver_;
+    resolver.answers_[std::string{ BootstrapName }] = *bootstrap_addr;
+    resolver.close_gate();
+
+    // the resolver never answers: construction must not wait for it
+    auto const begin = std::chrono::steady_clock::now();
+    auto dht = tr_dht::create(mediator, ArbitraryPeerPort, ArbitrarySock4, ArbitrarySock6);
+    EXPECT_LT(std::chrono::steady_clock::now() - begin, 500ms);
+    EXPECT_TRUE(waitFor(event_base_, [&resolver]() { return resolver.n_lookups() == 1U; }, 5s));
+
+    // the timer keeps running with nothing to ping
+    waitFor(event_base_, MockTimerInterval * 10);
+    auto& pinged = mediator.mock_dht_.pinged_;
+    EXPECT_TRUE(std::empty(pinged));
+
+    // once the names resolve, the answers are the bootstrap nodes
+    resolver.open_gate();
+    EXPECT_TRUE(waitFor(event_base_, [&pinged]() { return !std::empty(pinged); }, 5s));
+    EXPECT_EQ(*bootstrap_addr, pinged.front().addrport.address());
+    EXPECT_EQ(tr_port::from_host(6881), pinged.front().addrport.port());
+    EXPECT_EQ(3U, resolver.n_answered()); // every default bootstrap name was looked up, in one go
+}
+
+TEST_F(DhtTest, resolvedNamesFollowTheStateFileNodes)
+{
+    auto const state_file = MockStateFile{};
+    state_file.save(sandboxDir());
+
+    static auto constexpr BootstrapName = "router.bittorrent.com"sv;
+    auto const bootstrap_addr = tr_address::from_string("10.20.30.40");
+    ASSERT_TRUE(bootstrap_addr.has_value());
+
+    auto mediator = MockMediator{ event_base_ };
+    mediator.config_dir_ = sandboxDir();
+    mediator.mock_resolver_->answers_[std::string{ BootstrapName }] = *bootstrap_addr;
+    auto dht = tr_dht::create(mediator, ArbitraryPeerPort, ArbitrarySock4, ArbitrarySock6);
+
+    // the state file's nodes are pinged first, the resolved name after them
+    auto const n_state_nodes = std::size(state_file.ipv4_nodes_) + std::size(state_file.ipv6_nodes_);
+    auto& pinged = mediator.mock_dht_.pinged_;
+    EXPECT_TRUE(waitFor(event_base_, [&pinged, n_state_nodes]() { return std::size(pinged) > n_state_nodes; }, 5s));
+    EXPECT_EQ(*bootstrap_addr, pinged[n_state_nodes].addrport.address());
+}
+
+TEST_F(DhtTest, canBeDestroyedWhileTheResolverIsStillWorking)
+{
+    auto mediator = MockMediator{ event_base_ };
+    mediator.config_dir_ = sandboxDir();
+    auto const resolver = mediator.mock_resolver_; // outlives the mediator, like the worker that holds it
+    resolver->close_gate();
+
+    auto dht = tr_dht::create(mediator, ArbitraryPeerPort, ArbitrarySock4, ArbitrarySock6);
+    EXPECT_TRUE(waitFor(event_base_, [&resolver]() { return resolver->n_lookups() == 1U; }, 5s));
+
+    auto const begin = std::chrono::steady_clock::now();
+    dht.reset();
+    EXPECT_LT(std::chrono::steady_clock::now() - begin, 500ms);
+
+    // the lookup finishes on its own with nobody to report to
+    resolver->open_gate();
+    EXPECT_TRUE(waitFor([&resolver]() { return resolver->n_answered() == 3U; }, 5s));
 }
 
 TEST_F(DhtTest, pingsAddedNodes)
