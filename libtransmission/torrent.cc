@@ -2014,8 +2014,12 @@ void tr_torrent::recheck_completeness()
 
     // A piece whose hash check is still queued may yet fail. Do not report
     // the torrent complete (and so send a `completed` announce) until every
-    // check has answered; the last answer re-arms this check.
-    if (new_completeness != TR_LEECH && completeness_ == TR_LEECH && has_pending_piece_tests())
+    // check has answered; the last answer re-arms this check. Any arrival
+    // in a done state is gated, not just LEECH -> done: a partial seed
+    // cannot become a seed without passing through LEECH today (unwanted
+    // pieces are never requested, and changing wants rechecks at once),
+    // but the announce must not depend on that staying true.
+    if (new_completeness != TR_LEECH && completeness_ != new_completeness && has_pending_piece_tests())
     {
         needs_completeness_check_ = true;
         return;
