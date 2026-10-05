@@ -18,6 +18,7 @@
 #include "libtransmission/error.h"
 #include "libtransmission/file.h"
 #include "libtransmission/inout.h"
+#include "libtransmission/open-files.h"
 #include "libtransmission/session.h"
 #include "libtransmission/string-utils.h"
 #include "libtransmission/torrent-files.h"
@@ -68,7 +69,8 @@ bool write_entire_buf(tr_sys_file_t const fd, uint64_t file_offset, std::span<ui
     return true;
 }
 
-[[nodiscard]] std::optional<tr_sys_file_t> get_fd(
+// The returned lease keeps the fd open; hold it until the I/O on that fd is done.
+[[nodiscard]] tr_open_files::Lease get_fd(
     tr_session& session,
     tr_open_files& open_files,
     tr_torrent const& tor,
@@ -79,9 +81,9 @@ bool write_entire_buf(tr_sys_file_t const fd, uint64_t file_offset, std::span<ui
     auto const tor_id = tor.id();
 
     // is the file already open in the fd pool?
-    if (auto const fd = open_files.get(tor_id, file_index, writable); fd)
+    if (auto lease = open_files.get(tor_id, file_index, writable); lease)
     {
-        return fd;
+        return lease;
     }
 
     // does the file exist?
@@ -100,11 +102,11 @@ bool write_entire_buf(tr_sys_file_t const fd, uint64_t file_offset, std::span<ui
         auto const base = tor.current_dir();
         auto const suffix = session.isIncompleteFileNamingEnabled() ? tr_torrent_files::PartialFileSuffix : ""sv;
         auto const filename = tr_pathbuf{ base, '/', tor.file_subpath(file_index), suffix };
-        if (auto const fd = open_files.get(tor_id, file_index, writable, filename, prealloc, file_size); fd)
+        if (auto lease = open_files.get(tor_id, file_index, writable, filename, prealloc, file_size); lease)
         {
             // make a note that we just created a file
             session.add_file_created();
-            return fd;
+            return lease;
         }
 
         err = errno;
@@ -138,13 +140,13 @@ void read_bytes(
         return;
     }
 
-    auto const fd = get_fd(session, open_files, tor, false, file_index, error);
-    if (!fd || error)
+    auto const lease = get_fd(session, open_files, tor, false, file_index, error);
+    if (!lease || error)
     {
         return;
     }
 
-    read_entire_buf(*fd, file_offset, buf, error);
+    read_entire_buf(lease.fd(), file_offset, buf, error);
 
     if (error)
     {
@@ -176,13 +178,13 @@ void write_bytes(
         return;
     }
 
-    auto const fd = get_fd(session, open_files, tor, true, file_index, error);
-    if (!fd || error)
+    auto const lease = get_fd(session, open_files, tor, true, file_index, error);
+    if (!lease || error)
     {
         return;
     }
 
-    write_entire_buf(*fd, file_offset, buf, error);
+    write_entire_buf(lease.fd(), file_offset, buf, error);
 
     if (error)
     {

@@ -6,9 +6,12 @@
 #include <algorithm> // std::min
 #include <array>
 #include <cstdint> // uint8_t, uint64_t
+#include <memory>
+#include <mutex>
 #include <span>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -123,22 +126,99 @@ bool preallocate_file_full(tr_sys_file_t fd, uint64_t length, tr_error* error)
 
 // ---
 
-std::optional<tr_sys_file_t> tr_open_files::get(tr_torrent_id_t tor_id, tr_file_index_t file_num, bool writable)
+// Shared by the pool's slot and any leases; the last owner closes the fd.
+struct tr_open_files::File
 {
-    if (auto* const found = pool_.get(make_key(tor_id, file_num)); found != nullptr)
+    File(tr_sys_file_t fd_in, bool writable_in) noexcept
+        : fd{ fd_in }
+        , writable{ writable_in }
     {
-        if (writable && !found->writable_)
-        {
-            return {};
-        }
+    }
 
-        return found->fd_;
+    File(File const&) = delete;
+    File& operator=(File const&) = delete;
+    File(File&&) = delete;
+    File& operator=(File&&) = delete;
+
+    ~File()
+    {
+        tr_sys_file_close(fd);
+    }
+
+    tr_sys_file_t const fd;
+    bool const writable;
+};
+
+tr_sys_file_t tr_open_files::Lease::fd() const noexcept
+{
+    return file_ ? file_->fd : TR_BAD_SYS_FILE;
+}
+
+tr_open_files::tr_open_files(size_t max_open_files)
+    : slots_(max_open_files)
+{
+}
+
+tr_open_files::Slot* tr_open_files::find(Key const& key) noexcept
+{
+    auto const iter = std::ranges::find_if(slots_, [&key](Slot const& slot) { return slot.file && slot.key == key; });
+    return iter != std::end(slots_) ? &*iter : nullptr;
+}
+
+// Caches `file` under `key` and returns the file it displaced, if any,
+// so the caller can close that file after releasing mutex_.
+// A file is leased iff use_count() > 1. Leases are only created under
+// mutex_, so the count seen here can be stale-high but never stale-low:
+// a leased file is never evicted. If every slot is leased, `file` is
+// left uncached and closes when its lease is released.
+std::shared_ptr<tr_open_files::File> tr_open_files::add(Key const& key, std::shared_ptr<File> file)
+{
+    auto* slot = find(key);
+
+    if (slot == nullptr)
+    {
+        for (auto& candidate : slots_)
+        {
+            if (!candidate.file)
+            {
+                slot = &candidate;
+                break;
+            }
+
+            if (candidate.file.use_count() == 1 && (slot == nullptr || candidate.last_used < slot->last_used))
+            {
+                slot = &candidate;
+            }
+        }
+    }
+
+    if (slot == nullptr)
+    {
+        return {};
+    }
+
+    slot->key = key;
+    slot->last_used = ++use_counter_;
+    std::swap(slot->file, file);
+    return file;
+}
+
+tr_open_files::Lease tr_open_files::get(tr_torrent_id_t tor_id, tr_file_index_t file_num, bool writable)
+{
+    auto const lock = std::lock_guard{ mutex_ };
+
+    if (auto* const slot = find(make_key(tor_id, file_num)); slot != nullptr && (!writable || slot->file->writable))
+    {
+        slot->last_used = ++use_counter_;
+        return Lease{ slot->file };
     }
 
     return {};
 }
 
-std::optional<tr_sys_file_t> tr_open_files::get(
+// Holds mutex_ only for cache lookups and updates.
+// Opening, preallocating, and closing files happen outside it.
+tr_open_files::Lease tr_open_files::get(
     tr_torrent_id_t tor_id,
     tr_file_index_t file_num,
     bool writable,
@@ -146,17 +226,26 @@ std::optional<tr_sys_file_t> tr_open_files::get(
     tr_file_preallocation allocation,
     uint64_t file_size)
 {
-    // is there already an entry
-    auto key = make_key(tor_id, file_num);
-    if (auto* const found = pool_.get(key); found != nullptr)
-    {
-        if (!writable || found->writable_)
-        {
-            return found->fd_;
-        }
+    auto const key = make_key(tor_id, file_num);
 
-        pool_.erase(key); // close so we can re-open as writable
+    // is there already an entry
+    auto read_only = std::shared_ptr<File>{};
+    {
+        auto const lock = std::lock_guard{ mutex_ };
+
+        if (auto* const slot = find(key); slot != nullptr)
+        {
+            if (!writable || slot->file->writable)
+            {
+                slot->last_used = ++use_counter_;
+                return Lease{ slot->file };
+            }
+
+            // uncache so we can re-open as writable
+            read_only = std::move(slot->file);
+        }
     }
+    read_only.reset(); // closes it outside mutex_, unless it is leased
 
     // create subfolders, if any
     auto error = tr_error{};
@@ -170,7 +259,7 @@ std::optional<tr_sys_file_t> tr_open_files::get(
                     fmt::arg("path", dir),
                     fmt::arg("error", error.message()),
                     fmt::arg("error_code", error.code())));
-            return {};
+            return Lease{};
         }
     }
 
@@ -193,7 +282,7 @@ std::optional<tr_sys_file_t> tr_open_files::get(
                 fmt::arg("path", filename),
                 fmt::arg("error", error.message()),
                 fmt::arg("error_code", error.code())));
-        return {};
+        return Lease{};
     }
 
     if (writable && !already_existed && allocation != tr_file_preallocation::None)
@@ -223,7 +312,7 @@ std::optional<tr_sys_file_t> tr_open_files::get(
                     fmt::arg("error", error.message()),
                     fmt::arg("error_code", error.code())));
             tr_sys_file_close(fd);
-            return {};
+            return Lease{};
         }
 
         tr_logAddDebug(fmt::format("Preallocated file '{}' ({}, size: {})", filename, type, file_size));
@@ -243,36 +332,56 @@ std::optional<tr_sys_file_t> tr_open_files::get(
                 fmt::arg("error", error.message()),
                 fmt::arg("error_code", error.code())));
         tr_sys_file_close(fd);
-        return {};
+        return Lease{};
     }
 
     // cache it
-    auto& entry = pool_.add(std::move(key));
-    entry.fd_ = fd;
-    entry.writable_ = writable;
-
-    return fd;
+    auto file = std::make_shared<File>(fd, writable);
+    auto displaced = std::shared_ptr<File>{}; // destroyed after `lock`, so closed outside mutex_
+    auto const lock = std::lock_guard{ mutex_ };
+    displaced = add(key, file);
+    return Lease{ std::move(file) };
 }
+
+// The close_*() functions move files out of slots_ under mutex_; the files
+// close when `closing` is destroyed after `lock`, or, if leased, when their
+// last lease is released.
 
 void tr_open_files::close_all()
 {
-    pool_.clear();
+    auto closing = std::vector<std::shared_ptr<File>>{};
+    auto const lock = std::lock_guard{ mutex_ };
+
+    for (auto& slot : slots_)
+    {
+        if (slot.file)
+        {
+            closing.emplace_back(std::move(slot.file));
+        }
+    }
 }
 
 void tr_open_files::close_torrent(tr_torrent_id_t tor_id)
 {
-    pool_.erase_if([&tor_id](Key const& key, Val const& /*unused*/) { return key.first == tor_id; });
+    auto closing = std::vector<std::shared_ptr<File>>{};
+    auto const lock = std::lock_guard{ mutex_ };
+
+    for (auto& slot : slots_)
+    {
+        if (slot.file && slot.key.first == tor_id)
+        {
+            closing.emplace_back(std::move(slot.file));
+        }
+    }
 }
 
 void tr_open_files::close_file(tr_torrent_id_t tor_id, tr_file_index_t file_num)
 {
-    pool_.erase(make_key(tor_id, file_num));
-}
+    auto closing = std::shared_ptr<File>{};
+    auto const lock = std::lock_guard{ mutex_ };
 
-tr_open_files::Val::~Val()
-{
-    if (is_open(fd_))
+    if (auto* const slot = find(make_key(tor_id, file_num)); slot != nullptr)
     {
-        tr_sys_file_close(fd_);
+        closing = std::move(slot->file);
     }
 }
