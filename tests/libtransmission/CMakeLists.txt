@@ -43,6 +43,7 @@ target_sources(libtransmission-test
         peer-mgr-wishlist-test.cc
         peer-msgs-test.cc
         platform-test.cc
+        port-forwarding-upnp-test.cc
         quark-test.cc
         remove-test.cc
         rename-test.cc

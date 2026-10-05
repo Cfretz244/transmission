@@ -91,7 +91,9 @@ private:
         natpmp_.reset();
         natpmp_state_ = TR_PORT_UNMAPPED;
 
-        tr_upnpClose(upnp_);
+        // a clean shutdown waits (bounded) for the gateway to drop the
+        // mapping; a toggle-off lets the worker finish on its own
+        tr_upnpClose(upnp_, is_shutting_down_);
         upnp_ = nullptr;
         upnp_state_ = TR_PORT_UNMAPPED;
 
@@ -115,6 +117,14 @@ private:
         switch (state())
         {
         case TR_PORT_MAPPED:
+            // a UPnP port check is in flight; its result decides whether
+            // we are still mapped, so keep pulsing until it is in
+            if (upnp_ != nullptr && tr_upnpIsBusy(upnp_))
+            {
+                timer_->start_single_shot(333ms);
+                break;
+            }
+
             // if we're mapped, everything is fine... check back at `renew_time`
             // to renew the port forwarding if it's expired
             do_port_check_ = true;
