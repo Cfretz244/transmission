@@ -229,12 +229,7 @@ void on_files_deleted(tr_session* session, std::string const& path)
 
     for (auto* const tor : session->torrents())
     {
-        if (tor->deferred_init_ && !is_path_being_deleted(tor))
-        {
-            auto const deferred = *tor->deferred_init_;
-            tor->deferred_init_.reset();
-            tor->finish_init(deferred.is_new_torrent, deferred.has_any_local_data);
-        }
+        tor->finish_deferred_init_if_clear();
     }
 }
 
@@ -781,7 +776,9 @@ void tr_torrentRemoveInSessionThread(
 {
     auto const lock = tor->unique_lock();
 
-    if (delete_flag && tor->has_metainfo())
+    // A deferred torrent owns nothing on disk: the files under its path
+    // belong to a removed torrent and are already being deleted.
+    if (delete_flag && tor->has_metainfo() && !tor->deferred_init_)
     {
         tor->session->verify_remove(tor);
 
@@ -1016,6 +1013,13 @@ void tr_torrent::on_metainfo_updated()
 
 void tr_torrent::on_metainfo_completed()
 {
+    if (deferred_init_)
+    {
+        // its files are still being deleted; finish_init() comes back here
+        deferred_init_->is_new_torrent = true;
+        return;
+    }
+
     // we can look for files now that we know what files are in the torrent
     refresh_current_dir();
 
@@ -1208,6 +1212,18 @@ void tr_torrent::finish_init(bool const is_new_torrent, std::optional<bool> cons
     }
 }
 
+void tr_torrent::finish_deferred_init_if_clear()
+{
+    if (!deferred_init_ || is_path_being_deleted(this))
+    {
+        return;
+    }
+
+    auto const deferred = *deferred_init_;
+    deferred_init_.reset();
+    finish_init(deferred.is_new_torrent, deferred.has_any_local_data);
+}
+
 void tr_torrent::set_metainfo(tr_torrent_metainfo tm)
 {
     TR_ASSERT(!has_metainfo());
@@ -1296,7 +1312,10 @@ void tr_torrent::set_location(std::string_view location, bool move_from_old_path
                 return;
             }
 
-            if (!move_from_old_path)
+            // A deferred torrent has nothing of its own to move: the files
+            // under its current dir belong to a removed torrent and are
+            // being deleted. Just point it at the new location.
+            if (!move_from_old_path || tor->deferred_init_)
             {
                 tor->set_download_dir(path);
                 if (setme_state != nullptr)
@@ -2655,6 +2674,16 @@ void tr_torrent::set_download_dir(std::string_view path, bool is_new_torrent)
     download_dir_ = path;
     mark_edited();
     set_dirty();
+
+    if (deferred_init_)
+    {
+        // Not looking at files yet (see DeferredInit). If the new dir is
+        // not under a pending delete, finish_init() looks at them now.
+        current_dir_ = std::empty(incomplete_dir()) ? download_dir() : incomplete_dir();
+        finish_deferred_init_if_clear();
+        return;
+    }
+
     refresh_current_dir();
 
     if (is_new_torrent)
@@ -2895,6 +2924,17 @@ void tr_torrent::rename_path_in_session_thread(
 
     mark_edited();
     set_dirty();
+
+    if (deferred_init_)
+    {
+        // Nothing of this torrent's is on disk yet: the files under the old
+        // name belong to a removed torrent and are being deleted. Renaming
+        // the top would move them out from under that delete and make this
+        // torrent complete once it looks. The strings are enough.
+        finish_deferred_init_if_clear();
+        finish(oldpath, newname, 0);
+        return;
+    }
 
     session->local_data.rename(
         id(),

@@ -885,6 +885,11 @@ struct tr_torrent
     };
     std::optional<DeferredInit> deferred_init_;
 
+    // Call after a deferred torrent's dirs or name change: if it no longer
+    // points at files being deleted, it takes its first look at its files
+    // now instead of waiting for that delete.
+    void finish_deferred_init_if_clear();
+
     [[nodiscard]] constexpr auto has_changed_since(time_t when) const noexcept
     {
         return date_changed_ > when;

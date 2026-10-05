@@ -6,6 +6,7 @@
 #include <array>
 #include <cerrno>
 #include <cstdint> // uint64_t
+#include <memory>
 #include <set>
 #include <string>
 #include <string_view>
@@ -359,6 +360,93 @@ class RemoveTorrentTest : public tr::test::SessionTest
 {
 protected:
     static auto constexpr MaxWaitMsec = 3000;
+
+#ifndef _WIN32
+    // A complete torrent removed with its data while its disk queue is
+    // stalled, then added again before the delete has run. The re-added
+    // torrent is in deferred init: it must not look at, move, rename or
+    // delete the files under its path until the stall is released and the
+    // delete finishes. See tr_torrent::DeferredInit.
+    struct DeferredReadd
+    {
+        tr_torrent* readded = nullptr;
+        std::string download_dir;
+        std::string first_file; // a file of the removed torrent, still on disk
+        std::string fifo_path;
+        bool verified = false; // the re-added torrent has taken its first look at its files
+        bool stall_answered = false;
+    };
+
+    void makeDeferredReadd(std::shared_ptr<DeferredReadd>& setme)
+    {
+        auto state = std::make_shared<DeferredReadd>();
+
+        auto* const tor = zeroTorrentInit(ZeroTorrentState::Complete);
+        blockingTorrentVerify(tor);
+        ASSERT_TRUE(tor->has_all());
+        auto const info_hash = tor->info_hash();
+        state->download_dir = tr_sessionGetDownloadDir(session_);
+        state->first_file = tr_pathbuf{ state->download_dir, '/', tr_torrentFile(tor, 0).name };
+        ASSERT_TRUE(tr_sys_path_exists(state->first_file));
+
+        // Stall the torrent's disk queue, which runs one op at a time: a read
+        // whose "file" is a FIFO with no writer blocks in open() until the test
+        // opens the other end. Its file index is one the torrent doesn't have,
+        // so the fd pool never hands the FIFO out for a real block.
+        auto const fifo_name = "stall.fifo"sv;
+        state->fifo_path = tr_pathbuf{ state->download_dir, '/', fifo_name };
+        ASSERT_EQ(0, mkfifo(state->fifo_path.c_str(), 0600)) << tr_strerror(errno);
+        auto stall_plan = tor->make_io_plan(tor->block_info().byte_span_for_block(0U));
+        ASSERT_EQ(1U, std::size(stall_plan.files));
+        stall_plan.files[0].index = tor->file_count() + 1U;
+        stall_plan.files[0].subpath = fifo_name;
+        session_->local_data.read(
+            std::move(stall_plan),
+            [state](tr_torrent_id_t, tr_byte_span_t, tr_error const&, std::unique_ptr<tr::LocalData::BlockData>)
+            { state->stall_answered = true; });
+
+        // remove the torrent and its files: the delete queues behind the stall
+        tr_torrentRemove(tor, true);
+        ASSERT_TRUE(waitFor([this, &info_hash]() { return session_->torrents().get(info_hash) == nullptr; }, MaxWaitMsec));
+        ASSERT_FALSE(state->stall_answered);
+        ASSERT_TRUE(tr_sys_path_exists(state->first_file));
+
+        // Backdate the files so the re-added torrent takes the "this new torrent
+        // is already a seed" shortcut if it looks at them at all.
+        auto* const ctor = zeroTorrentCtor();
+        auto const* const metainfo = tr_ctorGetMetainfo(ctor);
+        auto const old_times = utimbuf{ 1000000000, 1000000000 };
+        for (tr_file_index_t i = 0, n = metainfo->file_count(); i < n; ++i)
+        {
+            ASSERT_EQ(0, utime(tr_pathbuf{ state->download_dir, '/', metainfo->file_subpath(i) }, &old_times))
+                << tr_strerror(errno);
+        }
+
+        // add it again while the delete is still pending
+        ctor->set_verify_done_callback([state](tr_torrent*) { state->verified = true; });
+        state->readded = tr_torrentNew(ctor, nullptr);
+        tr_ctorFree(ctor);
+        ASSERT_NE(nullptr, state->readded);
+
+        // it must not claim the old files
+        ASSERT_TRUE(state->readded->deferred_init_.has_value());
+        ASSERT_FALSE(state->readded->has_all());
+        ASSERT_TRUE(state->readded->has_none());
+        ASSERT_EQ(TR_STATUS_STOPPED, state->readded->activity());
+        ASSERT_FALSE(state->stall_answered);
+        ASSERT_TRUE(tr_sys_path_exists(state->first_file));
+
+        setme = std::move(state);
+    }
+
+    // Let the stalled read return, so the queued delete runs.
+    static void releaseStall(DeferredReadd const& state)
+    {
+        auto const writer = open(state.fifo_path.c_str(), O_WRONLY);
+        ASSERT_NE(-1, writer) << tr_strerror(errno);
+        EXPECT_EQ(0, close(writer));
+    }
+#endif
 };
 
 // "Remove with data, then add it again" is how users force a fresh
@@ -371,72 +459,159 @@ TEST_F(RemoveTorrentTest, readdedTorrentWaitsForPendingDelete)
 #ifdef _WIN32
     GTEST_SKIP() << "stalls the torrent's disk queue with a FIFO";
 #else
-    auto* const tor = zeroTorrentInit(ZeroTorrentState::Complete);
-    blockingTorrentVerify(tor);
-    ASSERT_TRUE(tor->has_all());
-    auto const info_hash = tor->info_hash();
-    auto const download_dir = std::string{ tr_sessionGetDownloadDir(session_) };
-    auto const first_file = tr_pathbuf{ download_dir, '/', tr_torrentFile(tor, 0).name };
-    ASSERT_TRUE(tr_sys_path_exists(first_file));
-
-    // Stall the torrent's disk queue, which runs one op at a time: a read
-    // whose "file" is a FIFO with no writer blocks in open() until the test
-    // opens the other end. Its file index is one the torrent doesn't have,
-    // so the fd pool never hands the FIFO out for a real block.
-    auto const fifo_name = "stall.fifo"sv;
-    auto const fifo_path = tr_pathbuf{ download_dir, '/', fifo_name };
-    ASSERT_EQ(0, mkfifo(fifo_path.c_str(), 0600)) << tr_strerror(errno);
-    auto stall_plan = tor->make_io_plan(tor->block_info().byte_span_for_block(0U));
-    ASSERT_EQ(1U, std::size(stall_plan.files));
-    stall_plan.files[0].index = tor->file_count() + 1U;
-    stall_plan.files[0].subpath = fifo_name;
-    auto stall_answered = false;
-    session_->local_data.read(
-        std::move(stall_plan),
-        [&stall_answered](tr_torrent_id_t, tr_byte_span_t, tr_error const&, std::unique_ptr<tr::LocalData::BlockData>)
-        { stall_answered = true; });
-
-    // remove the torrent and its files: the delete queues behind the stall
-    tr_torrentRemove(tor, true);
-    ASSERT_TRUE(waitFor([this, &info_hash]() { return session_->torrents().get(info_hash) == nullptr; }, MaxWaitMsec));
-    ASSERT_FALSE(stall_answered);
-    ASSERT_TRUE(tr_sys_path_exists(first_file));
-
-    // Backdate the files so the re-added torrent takes the "this new torrent
-    // is already a seed" shortcut if it looks at them at all.
-    auto* const ctor = zeroTorrentCtor();
-    auto const* const metainfo = tr_ctorGetMetainfo(ctor);
-    auto const old_times = utimbuf{ 1000000000, 1000000000 };
-    for (tr_file_index_t i = 0, n = metainfo->file_count(); i < n; ++i)
-    {
-        ASSERT_EQ(0, utime(tr_pathbuf{ download_dir, '/', metainfo->file_subpath(i) }, &old_times)) << tr_strerror(errno);
-    }
-
-    // add it again while the delete is still pending
-    auto verified = false;
-    ctor->set_verify_done_callback([&verified](tr_torrent*) { verified = true; });
-    auto* const readded = tr_torrentNew(ctor, nullptr);
-    tr_ctorFree(ctor);
-    ASSERT_NE(nullptr, readded);
-
-    // it must not claim the old files
-    EXPECT_FALSE(readded->has_all());
-    EXPECT_TRUE(readded->has_none());
-    EXPECT_EQ(TR_STATUS_STOPPED, readded->activity());
-    EXPECT_FALSE(stall_answered);
-    EXPECT_TRUE(tr_sys_path_exists(first_file));
+    auto state = std::shared_ptr<DeferredReadd>{};
+    ASSERT_NO_FATAL_FAILURE(makeDeferredReadd(state));
+    auto* const readded = state->readded;
 
     // release the stall: the delete runs, then the re-added torrent checks its files
-    auto const writer = open(fifo_path.c_str(), O_WRONLY);
-    ASSERT_NE(-1, writer) << tr_strerror(errno);
-    EXPECT_EQ(0, close(writer));
-    EXPECT_TRUE(waitFor([&first_file]() { return !tr_sys_path_exists(first_file); }, MaxWaitMsec));
-    EXPECT_TRUE(waitFor([&verified]() { return verified; }, MaxWaitMsec));
-    EXPECT_TRUE(stall_answered);
+    ASSERT_NO_FATAL_FAILURE(releaseStall(*state));
+    EXPECT_TRUE(waitFor([&state]() { return !tr_sys_path_exists(state->first_file); }, MaxWaitMsec));
+    EXPECT_TRUE(waitFor([&state]() { return state->verified; }, MaxWaitMsec));
+    EXPECT_TRUE(state->stall_answered);
 
+    EXPECT_FALSE(readded->deferred_init_.has_value());
     EXPECT_FALSE(readded->has_all());
     EXPECT_TRUE(readded->has_none());
     EXPECT_FALSE(readded->is_running());
-    EXPECT_FALSE(tr_sys_path_exists(first_file));
+    EXPECT_FALSE(tr_sys_path_exists(state->first_file));
+#endif
+}
+
+// A deferred torrent has nothing of its own on disk, so "move" has nothing
+// to move. Moving the files under its path would carry the removed
+// torrent's data out from under the delete and make this torrent complete.
+TEST_F(RemoveTorrentTest, movingADeferredTorrentDoesNotMoveTheFilesBeingDeleted)
+{
+#ifdef _WIN32
+    GTEST_SKIP() << "stalls the torrent's disk queue with a FIFO";
+#else
+    auto state = std::shared_ptr<DeferredReadd>{};
+    ASSERT_NO_FATAL_FAILURE(makeDeferredReadd(state));
+    auto* const readded = state->readded;
+
+    auto const new_dir = tr_pathbuf{ sandboxDir(), "/moved"sv };
+    ASSERT_TRUE(tr_sys_dir_create(new_dir, 0, 0700));
+    auto const moved_file = tr_pathbuf{ new_dir, '/', tr_torrentFile(readded, 0).name };
+
+    int volatile move_state = -1;
+    tr_torrentSetLocation(readded, new_dir.c_str(), true, &move_state);
+    EXPECT_TRUE(waitFor([&move_state]() { return move_state != TR_LOC_MOVING; }, MaxWaitMsec));
+    EXPECT_EQ(TR_LOC_DONE, move_state);
+
+    // the files stayed where the delete will find them...
+    EXPECT_TRUE(tr_sys_path_exists(state->first_file));
+    EXPECT_FALSE(tr_sys_path_exists(moved_file));
+    EXPECT_EQ(new_dir.sv(), readded->download_dir().sv());
+    EXPECT_EQ(new_dir.sv(), readded->current_dir().sv());
+
+    // ...and the torrent, pointing away from the delete now, took its first
+    // look at its (absent) files without waiting for it
+    EXPECT_TRUE(waitFor([&state]() { return state->verified; }, MaxWaitMsec));
+    EXPECT_FALSE(readded->deferred_init_.has_value());
+    EXPECT_TRUE(readded->has_none());
+    EXPECT_FALSE(state->stall_answered);
+
+    ASSERT_NO_FATAL_FAILURE(releaseStall(*state));
+    EXPECT_TRUE(waitFor([&state]() { return !tr_sys_path_exists(state->first_file); }, MaxWaitMsec));
+    EXPECT_TRUE(waitFor([&state]() { return state->stall_answered; }, MaxWaitMsec));
+    EXPECT_TRUE(readded->has_none());
+    EXPECT_FALSE(tr_sys_path_exists(moved_file));
+#endif
+}
+
+// Likewise rename: renaming the top directory on disk would move the removed
+// torrent's files out from under the delete. Only the strings change.
+TEST_F(RemoveTorrentTest, renamingADeferredTorrentLeavesTheFilesBeingDeletedAlone)
+{
+#ifdef _WIN32
+    GTEST_SKIP() << "stalls the torrent's disk queue with a FIFO";
+#else
+    auto state = std::shared_ptr<DeferredReadd>{};
+    ASSERT_NO_FATAL_FAILURE(makeDeferredReadd(state));
+    auto* const readded = state->readded;
+    auto const old_name = std::string{ readded->name() };
+    auto const renamed_path = tr_pathbuf{ state->download_dir, "/renamed"sv };
+
+    auto rename_error = -1;
+    tr_torrentRenamePath(
+        readded,
+        old_name,
+        "renamed",
+        [&rename_error](tr_torrent_id_t, std::string_view, std::string_view, tr_error const& error) noexcept
+        { rename_error = error ? error.code() : 0; });
+    EXPECT_TRUE(waitFor([&rename_error]() { return rename_error != -1; }, MaxWaitMsec));
+    EXPECT_EQ(0, rename_error);
+    EXPECT_EQ("renamed"sv, readded->name());
+
+    // nothing moved on disk...
+    EXPECT_TRUE(tr_sys_path_exists(state->first_file));
+    EXPECT_FALSE(tr_sys_path_exists(renamed_path));
+
+    // ...and under its new name the torrent is clear of the delete
+    EXPECT_TRUE(waitFor([&state]() { return state->verified; }, MaxWaitMsec));
+    EXPECT_FALSE(readded->deferred_init_.has_value());
+    EXPECT_TRUE(readded->has_none());
+    EXPECT_FALSE(state->stall_answered);
+
+    ASSERT_NO_FATAL_FAILURE(releaseStall(*state));
+    EXPECT_TRUE(waitFor([&state]() { return !tr_sys_path_exists(state->first_file); }, MaxWaitMsec));
+    EXPECT_TRUE(waitFor([&state]() { return state->stall_answered; }, MaxWaitMsec));
+    EXPECT_TRUE(readded->has_none());
+    EXPECT_FALSE(tr_sys_path_exists(renamed_path));
+#endif
+}
+
+// Pointing a deferred torrent at another download dir takes it out from
+// under the delete: it looks at the new dir right away, not the old files.
+TEST_F(RemoveTorrentTest, settingADeferredTorrentsDownloadDirChecksTheNewDir)
+{
+#ifdef _WIN32
+    GTEST_SKIP() << "stalls the torrent's disk queue with a FIFO";
+#else
+    auto state = std::shared_ptr<DeferredReadd>{};
+    ASSERT_NO_FATAL_FAILURE(makeDeferredReadd(state));
+    auto* const readded = state->readded;
+
+    auto const new_dir = tr_pathbuf{ sandboxDir(), "/elsewhere"sv };
+    ASSERT_TRUE(tr_sys_dir_create(new_dir, 0, 0700));
+    tr_torrentSetDownloadDir(readded, new_dir);
+
+    EXPECT_TRUE(waitFor([&state]() { return state->verified; }, MaxWaitMsec));
+    EXPECT_FALSE(readded->deferred_init_.has_value());
+    EXPECT_EQ(new_dir.sv(), readded->download_dir().sv());
+    EXPECT_TRUE(readded->has_none());
+    EXPECT_TRUE(tr_sys_path_exists(state->first_file));
+    EXPECT_FALSE(state->stall_answered);
+
+    ASSERT_NO_FATAL_FAILURE(releaseStall(*state));
+    EXPECT_TRUE(waitFor([&state]() { return !tr_sys_path_exists(state->first_file); }, MaxWaitMsec));
+    EXPECT_TRUE(readded->has_none());
+#endif
+}
+
+// Removing a deferred torrent with its data must not queue a second delete
+// of the same path: that one would run at once on the new torrent's queue,
+// unordered against the first, which still owns those files.
+TEST_F(RemoveTorrentTest, removingADeferredTorrentWithDataDeletesNothingItself)
+{
+#ifdef _WIN32
+    GTEST_SKIP() << "stalls the torrent's disk queue with a FIFO";
+#else
+    auto state = std::shared_ptr<DeferredReadd>{};
+    ASSERT_NO_FATAL_FAILURE(makeDeferredReadd(state));
+    auto const info_hash = state->readded->info_hash();
+
+    tr_torrentRemove(state->readded, true);
+    EXPECT_TRUE(waitFor([this, &info_hash]() { return session_->torrents().get(info_hash) == nullptr; }, MaxWaitMsec));
+
+    // the first delete still owns the files
+    EXPECT_FALSE(waitFor([&state]() { return !tr_sys_path_exists(state->first_file); }, 200));
+    EXPECT_EQ(1U, std::size(session_->deleting_paths_));
+    EXPECT_FALSE(state->stall_answered);
+
+    ASSERT_NO_FATAL_FAILURE(releaseStall(*state));
+    EXPECT_TRUE(waitFor([&state]() { return !tr_sys_path_exists(state->first_file); }, MaxWaitMsec));
+    EXPECT_TRUE(waitFor([this]() { return std::empty(session_->deleting_paths_); }, MaxWaitMsec));
+    EXPECT_TRUE(state->stall_answered);
 #endif
 }
