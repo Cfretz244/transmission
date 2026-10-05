@@ -1419,6 +1419,11 @@ void tr_session::closeImplPart1(std::promise<void>* closed_promise, std::chrono:
 
     torrent_queue().to_file();
 
+    // Let every queued write, move and close reach disk while the torrents
+    // still exist: a worker task that finishes after its torrent is freed
+    // would fail its lookup and drop the block. Queued reads are cancelled.
+    this->local_data.shutdown();
+
     // Close the torrents in order of most active to least active
     // so that the most important announce=stopped events are
     // fired out first...
@@ -1451,7 +1456,6 @@ void tr_session::closeImplPart1(std::promise<void>* closed_promise, std::chrono:
     auto const now = std::chrono::steady_clock::now();
     auto const remaining_ms = now < deadline ? std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now) : 0ms;
     this->web_->startShutdown(remaining_ms);
-    this->local_data.shutdown();
 
     // recycle the now-unused save_timer_ here to wait for UDP shutdown
     TR_ASSERT(!save_timer_);
