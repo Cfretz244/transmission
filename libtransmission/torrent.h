@@ -210,6 +210,10 @@ struct tr_torrent
 
     void save_resume_file();
 
+    // Queue a write of this torrent's .torrent or .magnet file on the
+    // session's state writer; a failure sets a local error on this torrent.
+    void save_store_file(std::string filename, std::string contents);
+
     [[nodiscard]] constexpr auto started_recently(time_t const now, time_t recent_secs = 120) const noexcept
     {
         return now - date_started_ <= recent_secs;

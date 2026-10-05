@@ -14,6 +14,7 @@
 
 #include <libtransmission/file.h>
 #include <libtransmission/session.h>
+#include <libtransmission/torrent-metainfo.h>
 #include <libtransmission/torrent.h>
 #include <libtransmission/torrent-ctor.h>
 #include <libtransmission/tr-strbuf.h>
@@ -222,4 +223,44 @@ TEST_F(TorrentTest, removedTorrentsResumeFileIsDeletedBehindQueuedSaves)
 
     session_->state_writer.flush(resume_file);
     EXPECT_FALSE(tr_sys_path_exists(resume_file));
+}
+
+// The .torrent file saved at add time is written on the state-writer
+// thread too, and a tracker edit rewrites it there.
+TEST_F(TorrentTest, storeFileIsWrittenAndRewrittenOffTheSessionThread)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::NoFiles);
+    auto const store_file = std::string{ tor->store_file() };
+
+    session_->state_writer.flush(store_file);
+    ASSERT_TRUE(tr_sys_path_exists(store_file));
+    auto on_disk = tr_torrent_metainfo{};
+    ASSERT_TRUE(on_disk.parse_torrent_file(store_file));
+    static auto constexpr Tracker = "http://127.0.0.1:1/announce"sv;
+    EXPECT_NE(Tracker, on_disk.announce_list().at(0).announce.sv());
+
+    // a tracker edit on a paused torrent: nothing is announced, but the
+    // .torrent on disk must carry the new list
+    EXPECT_TRUE(tr_torrentSetTrackerList(tor, Tracker));
+    EXPECT_FALSE(tor->is_running());
+    session_->state_writer.flush(store_file);
+    ASSERT_TRUE(on_disk.parse_torrent_file(store_file));
+    ASSERT_EQ(1U, std::size(on_disk.announce_list()));
+    EXPECT_EQ(Tracker, on_disk.announce_list().at(0).announce.sv());
+}
+
+TEST_F(TorrentTest, removedTorrentsStoreFileIsDeletedBehindQueuedSaves)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::NoFiles);
+    auto const store_file = std::string{ tor->store_file() };
+    auto const info_hash = tor->info_hash();
+    session_->state_writer.flush(store_file);
+    ASSERT_TRUE(tr_sys_path_exists(store_file));
+
+    EXPECT_TRUE(tr_torrentSetTrackerList(tor, "http://127.0.0.1:1/announce"sv)); // queues a rewrite
+    tr_torrentRemove(tor, false);
+    EXPECT_TRUE(waitFor([this, &info_hash]() { return session_->torrents().get(info_hash) == nullptr; }, 3000));
+
+    session_->state_writer.flush(store_file);
+    EXPECT_FALSE(tr_sys_path_exists(store_file));
 }

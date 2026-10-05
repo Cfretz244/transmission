@@ -858,15 +858,17 @@ void tr_torrentFreeInSessionThread(tr_torrent* tor)
 
     if (tor->is_deleting_)
     {
-        tr_torrent_metainfo::remove_file(tor->session->torrentDir(), tor->name(), tor->info_hash_string(), ".torrent"sv);
-        tr_torrent_metainfo::remove_file(tor->session->torrentDir(), tor->name(), tor->info_hash_string(), ".magnet"sv);
-
-        // Resume files are written on the state-writer thread; delete this
-        // one there too, so the delete runs after any save still queued.
-        for (auto& filename :
-             tr_torrent_metainfo::removable_files(tor->session->resumeDir(), tor->name(), tor->info_hash_string(), ".resume"sv))
+        // These files are written on the state-writer thread; delete them
+        // there too, so each delete runs after any save still queued.
+        auto* const session = tor->session;
+        for (auto const& [dir, suffix] : { std::pair{ session->torrentDir(), ".torrent"sv },
+                                           std::pair{ session->torrentDir(), ".magnet"sv },
+                                           std::pair{ session->resumeDir(), ".resume"sv } })
         {
-            tor->session->state_writer.remove(std::move(filename));
+            for (auto& filename : tr_torrent_metainfo::removable_files(dir, tor->name(), tor->info_hash_string(), suffix))
+            {
+                session->state_writer.remove(std::move(filename));
+            }
         }
     }
 
@@ -1149,35 +1151,17 @@ void tr_torrent::init(tr_ctor const& ctor)
         has_any_local_data = std::ranges::any_of(file_mtimes_, [](auto mtime) { return mtime > 0; });
     }
 
-    auto const file_path = store_file();
+    auto file_path = std::string{ store_file() };
 
     // if we don't have a local .torrent or .magnet file already,
-    // assume the torrent is new
+    // assume the torrent is new. (A remove of that file may still be
+    // queued on the state writer if this torrent was just removed.)
+    session->state_writer.flush(file_path);
     bool const is_new_torrent = !tr_sys_path_exists(file_path);
 
     if (is_new_torrent)
     {
-        auto error = tr_error{};
-
-        if (has_metainfo()) // torrent file
-        {
-            ctor.save(file_path, &error);
-        }
-        else // magnet link
-        {
-            auto const magnet_link = magnet();
-            tr_file_save(file_path, magnet_link, &error);
-        }
-
-        if (error)
-        {
-            this->error().set_local_error(
-                fmt::format(
-                    fmt::runtime(_("Couldn't save '{path}': {error} ({error_code})")),
-                    fmt::arg("path", file_path),
-                    fmt::arg("error", error.message()),
-                    fmt::arg("error_code", error.code())));
-        }
+        save_store_file(std::move(file_path), has_metainfo() ? std::string{ ctor.contents() } : magnet());
     }
 
     torrent_announcer = session->announcer_->addTorrent(this, &tr_torrent::on_tracker_response);
@@ -2055,6 +2039,34 @@ void tr_torrent::VerifyMediator::on_verify_done(bool const aborted)
 
 // ---
 
+void tr_torrent::save_store_file(std::string filename, std::string contents)
+{
+    session->state_writer.save(
+        filename,
+        std::move(contents),
+        [session = this->session, tor_id = id(), filename](tr_error const& error)
+        {
+            if (!error)
+            {
+                return;
+            }
+
+            session->run_in_session_thread(
+                [session, tor_id, filename, message = std::string{ error.message() }, code = error.code()]()
+                {
+                    if (auto* const tor = session->torrents().get(tor_id); tor != nullptr)
+                    {
+                        tor->error().set_local_error(
+                            fmt::format(
+                                fmt::runtime(_("Couldn't save '{path}': {error} ({error_code})")),
+                                fmt::arg("path", filename),
+                                fmt::arg("error", message),
+                                fmt::arg("error_code", code)));
+                    }
+                });
+        });
+}
+
 void tr_torrent::save_resume_file()
 {
     if (!is_dirty())
@@ -2359,30 +2371,33 @@ bool tr_torrent::set_announce_list(tr_announce_list announce_list)
 
     tgt = std::move(announce_list);
 
-    // save the changes
-    auto save_error = tr_error{};
-    auto filename = std::string{};
+    // save the changes: the .torrent is rebuilt from the one on disk, so
+    // wait for any write of it still queued, then queue the new one
+    auto read_error = tr_error{};
     if (has_metainfo())
     {
-        filename = torrent_file();
-        tgt.save(filename, &save_error);
+        auto filename = std::string{ torrent_file() };
+        session->state_writer.flush(filename);
+        if (auto contents = tgt.to_torrent_file_contents(filename, &read_error); contents)
+        {
+            save_store_file(std::move(filename), std::move(*contents));
+        }
     }
     else
     {
-        filename = magnet_file();
-        tr_file_save(filename, magnet(), &save_error);
+        save_store_file(std::string{ magnet_file() }, magnet());
     }
 
     on_announce_list_changed();
 
-    if (save_error.has_value())
+    if (read_error.has_value())
     {
         error().set_local_error(
             fmt::format(
                 fmt::runtime(_("Couldn't save '{path}': {error} ({error_code})")),
-                fmt::arg("path", filename),
-                fmt::arg("error", save_error.message()),
-                fmt::arg("error_code", save_error.code())));
+                fmt::arg("path", torrent_file()),
+                fmt::arg("error", read_error.message()),
+                fmt::arg("error_code", read_error.code())));
         return false;
     }
 

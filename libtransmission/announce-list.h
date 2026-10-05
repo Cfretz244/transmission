@@ -113,6 +113,11 @@ public:
 
     bool save(std::string_view torrent_file, tr_error* error = nullptr) const;
 
+    // `torrent_file` with its trackers replaced by this list, ready to be
+    // written back; nullopt (and `error`) if the file could not be read.
+    [[nodiscard]] std::optional<std::string> to_torrent_file_contents(std::string_view torrent_file, tr_error* error = nullptr)
+        const;
+
     [[nodiscard]] static std::optional<std::string> announce_to_scrape(std::string_view announce);
 
 private:

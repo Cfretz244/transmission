@@ -26,6 +26,7 @@
 #include "libtransmission/file-utils.h"
 #include "libtransmission/file.h"
 #include "libtransmission/quark.h"
+#include "libtransmission/session.h"
 #include "libtransmission/torrent-magnet.h"
 #include "libtransmission/torrent-metainfo.h"
 #include "libtransmission/torrent.h"
@@ -106,7 +107,10 @@ void tr_torrent::maybe_start_metadata_transfer(int64_t const size) noexcept
         return {};
     }
 
-    auto in = std::ifstream{ torrent_file(), std::ios_base::in | std::ios_base::binary };
+    // the .torrent file is written on the state-writer thread
+    auto const filename = torrent_file();
+    session->state_writer.flush(filename);
+    auto in = std::ifstream{ filename, std::ios_base::in | std::ios_base::binary };
     if (!in.is_open())
     {
         return {};
@@ -132,14 +136,15 @@ void tr_torrent::maybe_start_metadata_transfer(int64_t const size) noexcept
 
 bool tr_torrent::use_metainfo_from_file(tr_torrent_metainfo const* metainfo, char const* filename_in, tr_error* error)
 {
-    // add .torrent file
+    // add .torrent file (behind any write of it the state writer still holds)
+    session->state_writer.flush(torrent_file());
     if (!tr_sys_path_copy(filename_in, torrent_file(), error))
     {
         return false;
     }
 
     // remove .magnet file
-    tr_sys_path_remove(magnet_file());
+    session->state_writer.remove(std::string{ magnet_file() });
 
     // tor should keep this metainfo
     set_metainfo(*metainfo);
@@ -238,14 +243,10 @@ tr_variant build_metainfo_except_info_dict(tr_torrent_metainfo const& tm)
         return false;
     }
 
-    // save it
-    if (!tr_file_save(torrent_file(), benc, error))
-    {
-        return false;
-    }
-
-    // remove .magnet file
-    tr_sys_path_remove(magnet_file());
+    // save it, and drop the .magnet file, on the state-writer thread. A
+    // failed write sets a local error; the metainfo itself is good.
+    save_store_file(std::string{ torrent_file() }, std::string{ benc });
+    session->state_writer.remove(std::string{ magnet_file() });
 
     // tor should keep this metainfo
     set_metainfo(metainfo);

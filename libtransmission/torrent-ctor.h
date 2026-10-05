@@ -71,6 +71,12 @@ public:
 
     bool save(std::string_view filename, tr_error* error = nullptr) const;
 
+    // the raw .torrent file this ctor was built from, or empty for a magnet
+    [[nodiscard]] std::string_view contents() const noexcept
+    {
+        return { std::data(contents_), std::size(contents_) };
+    }
+
     // ---
 
     void set_files_wanted(tr_file_index_t const* files, tr_file_index_t n_files, bool wanted)

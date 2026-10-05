@@ -4,7 +4,9 @@
 // License text can be found in the licenses/ folder.
 
 #include <algorithm>
+#include <cerrno>
 #include <ranges>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -274,6 +276,12 @@ void tr_announce_list::add_to_map(tr_variant::Map& setme) const
 
 bool tr_announce_list::save(std::string_view torrent_file, tr_error* error) const
 {
+    auto const contents = to_torrent_file_contents(torrent_file, error);
+    return contents && tr_file_save(torrent_file, *contents, error);
+}
+
+std::optional<std::string> tr_announce_list::to_torrent_file_contents(std::string_view torrent_file, tr_error* error) const
+{
     // load the torrent file
     auto serde = tr_variant_serde::benc();
     auto ometainfo = serde.parse_file(torrent_file);
@@ -285,7 +293,7 @@ bool tr_announce_list::save(std::string_view torrent_file, tr_error* error) cons
             serde.error_ = {};
         }
 
-        return false;
+        return {};
     }
     auto& metainfo = *ometainfo;
 
@@ -296,14 +304,18 @@ bool tr_announce_list::save(std::string_view torrent_file, tr_error* error) cons
     }
 
     // confirm that it's good by parsing it back again
-    auto const contents = serde.to_string(metainfo);
+    auto contents = serde.to_string(metainfo);
     if (!serde.parse(contents).has_value())
     {
-        return false;
+        if (error != nullptr)
+        {
+            error->set(EINVAL, "rebuilt torrent file does not parse"sv);
+        }
+
+        return {};
     }
 
-    // save it
-    return tr_file_save(torrent_file, contents, error);
+    return contents;
 }
 
 bool tr_announce_list::parse(std::string_view text)
