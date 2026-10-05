@@ -243,6 +243,90 @@ TEST_F(CorruptPieceTest, doesNotCompleteOnCorruptPiece)
     tr_torrentRemove(tor, true);
 }
 
+// A check that cannot read the piece back must not leave the piece
+// counted as held: that would announce `left` short of the truth and, if
+// it was the last piece, send `completed` for data nobody ever hashed.
+TEST_F(CorruptPieceTest, dropsPieceWhenCheckCannotReadIt)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Partial);
+    auto const piece_bytes = tor->piece_size();
+    EXPECT_EQ(piece_bytes, tr_torrentStat(tor).left_until_done);
+
+    struct WriteData
+    {
+        tr_session* session = {};
+        tr_torrent* tor = {};
+        tr_block_index_t block = {};
+        std::unique_ptr<tr::LocalData::BlockData> buf;
+        bool done = {};
+    };
+
+    // write every block of piece 0 but hold back the last on_block_received,
+    // so the piece's check is not queued yet
+    auto const [begin, end] = tor->block_span_for_piece(0);
+    for (tr_block_index_t block = begin; block < end; ++block)
+    {
+        auto data = WriteData{};
+        data.session = session_;
+        data.tor = tor;
+        data.block = block;
+        data.buf = std::make_unique<tr::LocalData::BlockData>(tr_block_info::BlockSize);
+        std::fill_n(std::data(*data.buf), tr_block_info::BlockSize, '\0');
+        session_->run_in_session_thread(
+            [](WriteData* data_ptr, bool const is_last)
+            {
+                data_ptr->session->local_data.write(
+                    data_ptr->tor->make_io_plan(data_ptr->tor->block_info().byte_span_for_block(data_ptr->block)),
+                    std::move(data_ptr->buf),
+                    [data_ptr, is_last](tr_torrent_id_t, tr_byte_span_t, tr_error const& error, bool)
+                    {
+                        data_ptr->session->run_in_session_thread(
+                            [data_ptr, is_last, error]()
+                            {
+                                EXPECT_FALSE(error) << error;
+                                if (!is_last)
+                                {
+                                    data_ptr->tor->on_block_received(data_ptr->block);
+                                }
+                                data_ptr->done = true;
+                            });
+                    });
+            },
+            &data,
+            block + 1U == end);
+        EXPECT_TRUE(waitFor([&data]() { return data.done; }, MaxWaitMsec));
+    }
+
+    // make the piece unreadable: the file goes away on disk, and the torrent's
+    // cached fd for it is closed by a task that sits ahead of the check in the
+    // torrent's FIFO, so the check has to reopen the file and fails to
+    auto const filename = std::string{ tr_torrentFindFile(tor, 0) };
+    ASSERT_FALSE(std::empty(filename));
+    ASSERT_TRUE(tr_sys_path_remove(filename));
+    session_->local_data.close_torrent(tor->id());
+
+    auto done = false;
+    session_->run_in_session_thread(
+        [tor, end = end, &done]()
+        {
+            tor->on_block_received(end - 1U);
+            EXPECT_TRUE(tor->has_piece(0U));
+            EXPECT_TRUE(tor->has_pending_piece_tests());
+            done = true;
+        });
+    EXPECT_TRUE(waitFor([&done]() { return done; }, MaxWaitMsec));
+    EXPECT_TRUE(waitFor([tor]() { return !tor->has_pending_piece_tests(); }, MaxWaitMsec));
+
+    // the check failed to read, so the piece is missing again
+    EXPECT_FALSE(tor->has_piece(0U));
+    EXPECT_EQ(piece_bytes, tr_torrentStat(tor).left_until_done);
+    EXPECT_EQ(0U, tor->unverified_bytes());
+    EXPECT_FALSE(tor->is_done());
+    EXPECT_TRUE(tor->error().is_local_error());
+
+    tr_torrentRemove(tor, true);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     IncompleteDir,
     IncompleteDirTest,

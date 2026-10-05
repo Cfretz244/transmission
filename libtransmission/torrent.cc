@@ -2353,14 +2353,36 @@ void tr_torrent::on_block_received(tr_block_index_t const block)
                     --tor->n_pending_piece_tests_;
                     tor->pending_piece_test_bytes_ -= tor->piece_size(piece);
 
+                    // The piece was cleared (a verify, or an earlier failed
+                    // check) while this check was queued. Whatever is on
+                    // disk now will get its own check; this answer is stale.
+                    if (!tor->has_piece(piece))
+                    {
+                        return;
+                    }
+
+                    if (error.code() == ECANCELED)
+                    {
+                        // The check was discarded because the torrent is
+                        // going away. Its bytes are probably fine but were
+                        // never hashed, so they must not be saved as complete.
+                        tor->set_has_piece(piece, false);
+                        tor->set_dirty();
+                        return;
+                    }
+
                     if (error)
                     {
+                        // Same as main: a piece that can't be read back
+                        // counts as a failed check, so it is cleared and
+                        // downloaded again rather than announced as held.
                         tor->error().set_local_error(
                             fmt::format(
                                 fmt::runtime(_("Couldn't verify piece #{piece}: {error} ({error_code})")),
                                 fmt::arg("piece", piece),
                                 fmt::arg("error", error.message()),
                                 fmt::arg("error_code", error.code())));
+                        tor->on_piece_failed(piece);
                         return;
                     }
 
