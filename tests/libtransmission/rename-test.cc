@@ -530,7 +530,7 @@ TEST_F(RenameTest, renameRunsAfterQueuedWrites)
     auto const fifo_name = "stall.fifo"sv;
     auto const fifo_path = tr_pathbuf{ download_dir, '/', fifo_name };
     ASSERT_EQ(0, mkfifo(fifo_path.c_str(), 0600)) << tr_strerror(errno);
-    auto stall_plan = tor->make_io_plan(tor->block_info().byte_span_for_block(0U));
+    auto stall_plan = makeIoPlan(tor);
     ASSERT_EQ(1U, std::size(stall_plan.files));
     stall_plan.files[0].index = tor->file_count() + 1U;
     stall_plan.files[0].subpath = fifo_name;
@@ -545,7 +545,7 @@ TEST_F(RenameTest, renameRunsAfterQueuedWrites)
     auto buf = std::make_unique<tr::LocalData::BlockData>(tr_block_info::BlockSize);
     std::fill_n(std::data(*buf), tr_block_info::BlockSize, '\0');
     session_->local_data.write(
-        tor->make_io_plan(tor->block_info().byte_span_for_block(0U)),
+        makeIoPlan(tor),
         std::move(buf),
         [&written](tr_torrent_id_t, tr_byte_span_t, tr_error const& error, bool)
         {

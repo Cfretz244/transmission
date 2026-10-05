@@ -6,6 +6,7 @@
 #pragma once
 
 #include <atomic>
+#include <future>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib> // getenv()
@@ -382,6 +383,18 @@ protected:
     // A finished verify queues a path update per file on the torrent's
     // LocalData queue (adding or dropping the ".part" suffix), which runs
     // after the verify-done callback. Queue a read behind them and wait for
+    // tr_torrent::make_io_plan() reads torrent state that only the session
+    // thread may touch, so a test building a plan on its own thread goes
+    // through here.
+    [[nodiscard]] tr_io_plan makeIoPlan(tr_torrent* tor, tr_block_index_t block = 0U)
+    {
+        auto plan = std::promise<tr_io_plan>{};
+        auto future = plan.get_future();
+        session_->run_in_session_thread([tor, block, &plan]()
+                                        { plan.set_value(tor->make_io_plan(tor->block_info().byte_span_for_block(block))); });
+        return future.get();
+    }
+
     // it, so a test that looks at the files next sees them settled.
     void drainLocalData(tr_torrent* tor)
     {

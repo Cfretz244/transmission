@@ -392,7 +392,7 @@ protected:
         // is_active() wait below can only be satisfied by the stall.
         auto const drained = std::make_shared<std::atomic<bool>>(false);
         session_->local_data.read(
-            tor->make_io_plan(tor->block_info().byte_span_for_block(0U)),
+            makeIoPlan(tor),
             [drained](tr_torrent_id_t, tr_byte_span_t, tr_error const&, std::unique_ptr<tr::LocalData::BlockData>)
             { *drained = true; });
         ASSERT_TRUE(waitFor([drained]() { return drained->load(); }, MaxWaitMsec));
@@ -407,7 +407,7 @@ protected:
         auto const fifo_name = "stall.fifo"sv;
         state->fifo_path = tr_pathbuf{ state->download_dir, '/', fifo_name };
         ASSERT_EQ(0, mkfifo(state->fifo_path.c_str(), 0600)) << tr_strerror(errno);
-        auto stall_plan = tor->make_io_plan(tor->block_info().byte_span_for_block(0U));
+        auto stall_plan = makeIoPlan(tor);
         ASSERT_EQ(1U, std::size(stall_plan.files));
         stall_plan.files[0].index = tor->file_count() + 1U;
         stall_plan.files[0].subpath = fifo_name;

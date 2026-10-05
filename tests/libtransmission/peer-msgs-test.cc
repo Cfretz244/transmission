@@ -252,7 +252,7 @@ TEST_F(PeerMsgsTest, uploadReadsAreABoundedLookahead)
     auto const fifo_name = "stall.fifo"sv;
     auto const fifo_path = tr_pathbuf{ tr_sessionGetDownloadDir(session_), '/', fifo_name };
     ASSERT_EQ(0, mkfifo(fifo_path.c_str(), 0600)) << tr_strerror(errno);
-    auto stall_plan = tor->make_io_plan(tor->block_info().byte_span_for_block(0U));
+    auto stall_plan = makeIoPlan(tor);
     ASSERT_EQ(1U, std::size(stall_plan.files));
     stall_plan.files[0].index = tor->file_count() + 1U;
     stall_plan.files[0].subpath = fifo_name;

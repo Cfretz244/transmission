@@ -711,7 +711,7 @@ protected:
     {
         auto done = false;
         session_->local_data.read(
-            tor->make_io_plan(tor->block_info().byte_span_for_block(tor->block_span_for_piece(piece).begin)),
+            makeIoPlan(tor, tor->block_span_for_piece(piece).begin),
             [&done](tr_torrent_id_t, tr_byte_span_t, tr_error const&, std::unique_ptr<tr::LocalData::BlockData>)
             { done = true; });
         EXPECT_TRUE(waitFor([&done]() { return done; }, MaxWaitMsec));
