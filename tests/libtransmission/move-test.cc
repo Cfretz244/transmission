@@ -91,11 +91,11 @@ TEST_P(IncompleteDirTest, incompleteDir)
     {
         auto const event = tr_peer_event::GotBlock(data->tor->block_info(), data->block);
         data->session->local_data.write(
-            data->tor->id(),
-            data->tor->block_info().byte_span_for_block(data->block),
+            data->tor->make_io_plan(data->tor->block_info().byte_span_for_block(data->block)),
             std::move(data->buf),
-            [data, event](tr_torrent_id_t, tr_byte_span_t, tr_error const& error)
+            [data, event](tr_torrent_id_t tor_id, tr_byte_span_t, tr_error const& error, bool created_file)
             {
+                tr_torrent::on_local_write_done(*data->session, tor_id, error, created_file);
                 data->session->run_in_session_thread(
                     [data, event, error]()
                     {
@@ -198,11 +198,11 @@ TEST_F(CorruptPieceTest, doesNotCompleteOnCorruptPiece)
     auto const write_block = [](WriteData* data) noexcept
     {
         data->session->local_data.write(
-            data->tor->id(),
-            data->tor->block_info().byte_span_for_block(data->block),
+            data->tor->make_io_plan(data->tor->block_info().byte_span_for_block(data->block)),
             std::move(data->buf),
-            [data](tr_torrent_id_t, tr_byte_span_t, tr_error const& error)
+            [data](tr_torrent_id_t tor_id, tr_byte_span_t, tr_error const& error, bool created_file)
             {
+                tr_torrent::on_local_write_done(*data->session, tor_id, error, created_file);
                 data->session->run_in_session_thread(
                     [data, error]()
                     {

@@ -28,11 +28,10 @@
 #include "libtransmission/error.h"
 #include "libtransmission/file.h"
 #include "libtransmission/inout.h"
+#include "libtransmission/log.h"
 #include "libtransmission/open-files.h"
 #include "libtransmission/string-utils.h"
 #include "libtransmission/torrent-files.h"
-#include "libtransmission/torrent.h"
-#include "libtransmission/torrents.h"
 #include "libtransmission/transmission.h"
 #include "libtransmission/tr-strbuf.h"
 #include "libtransmission/utils.h"
@@ -46,12 +45,6 @@ namespace
 // beyond a few outstanding requests, and each idle worker costs a thread.
 auto constexpr MaxDefaultWorkers = size_t{ 4U };
 
-struct HashResult
-{
-    tr_error_code_t error = 0;
-    std::optional<tr_sha1_digest_t> hash;
-};
-
 [[nodiscard]] tr_error make_error(tr_error_code_t err)
 {
     auto error = tr_error{};
@@ -62,146 +55,89 @@ struct HashResult
     return error;
 }
 
-[[nodiscard]] HashResult recalculate_hash(
-    LocalData::Backend& backend,
-    tr_torrent_id_t const id,
-    tr_block_info const block_info,
-    tr_piece_index_t const piece)
+[[nodiscard]] tr_io_result make_result(tr_error_code_t err)
 {
-    TR_ASSERT(piece < block_info.piece_count());
+    auto result = tr_io_result{};
+    result.error = make_error(err);
+    return result;
+}
 
-    auto sha = tr_sha1{};
-    auto buffer = LocalData::BlockData{};
-
-    auto const [begin_byte, end_byte] = block_info.byte_span_for_piece(piece);
-    auto const [begin_block, end_block] = block_info.block_span_for_piece(piece);
-    [[maybe_unused]] auto n_bytes_checked = size_t{};
-    for (auto block = begin_block; block < end_block; ++block)
+void log_result(tr_io_result const& result, std::string_view const tor_name)
+{
+    if (!std::empty(result.log_message))
     {
-        auto const byte_span = block_info.byte_span_for_block(block);
-        buffer.clear();
-        if (auto const err = backend.read(id, byte_span, buffer); err != 0)
-        {
-            return { .error = err, .hash = {} };
-        }
-
-        auto* begin = std::data(buffer);
-        auto* end = begin + byte_span.size();
-        if (block == begin_block)
-        {
-            begin += (begin_byte - byte_span.begin);
-        }
-        if (block + 1U == end_block)
-        {
-            end -= (byte_span.end - end_byte);
-        }
-
-        sha.add(begin, end - begin);
-        n_bytes_checked += (end - begin);
+        tr_logAddError(std::string{ result.log_message }, tor_name);
     }
-
-    TR_ASSERT(block_info.piece_size(piece) == n_bytes_checked);
-    return { .error = 0, .hash = sha.finish() };
 }
 
 class DefaultBackend final : public LocalData::Backend
 {
 public:
-    DefaultBackend(tr_torrents const& torrents, tr_open_files& open_files)
+    explicit DefaultBackend(tr_open_files& open_files)
         : open_files_{ open_files }
-        , torrents_{ torrents }
     {
     }
 
-    [[nodiscard]] tr_error_code_t read(tr_torrent_id_t const id, tr_byte_span_t const byte_span, LocalData::BlockData& setme)
-        override
+    [[nodiscard]] tr_io_result read(tr_io_plan const& plan, LocalData::BlockData& setme) override
     {
-        if (!byte_span.is_valid())
+        auto const len = plan.byte_span.is_valid() ? plan.byte_span.size() : 0U;
+        if (len > setme.capacity())
         {
-            return TR_ERROR_EINVAL;
+            return make_result(TR_ERROR_EINVAL);
         }
 
-        auto const* const tor = torrents_.get(id);
-        if (tor == nullptr)
-        {
-            return TR_ERROR_EINVAL;
-        }
-
-        auto const len = byte_span.size();
         auto const span_size = static_cast<size_t>(len);
-        auto const loc = tor->byte_loc(byte_span.begin);
-        if (len == 0U || len > std::size(setme) + setme.capacity() - std::size(setme) ||
-            loc.byte + len > tor->total_size())
-        {
-            return TR_ERROR_EINVAL;
-        }
-
         setme.resize(span_size);
-        return tr_ioRead(*tor, open_files_, loc, std::span{ std::data(setme), span_size });
+        return tr_ioRead(plan, open_files_, 0U, std::span{ std::data(setme), span_size });
     }
 
-    [[nodiscard]] tr_error_code_t test_piece(
-        tr_torrent_id_t const id,
-        tr_piece_index_t const piece,
-        tr_sha1_digest_t& setme_hash) override
+    [[nodiscard]] tr_io_result test_piece(tr_io_plan const& plan, tr_sha1_digest_t& setme_hash) override
     {
-        auto const* const tor = torrents_.get(id);
-        if (tor == nullptr || piece >= tor->piece_count())
+        auto const n_bytes = plan.byte_span.is_valid() ? plan.byte_span.size() : 0U;
+        if (n_bytes == 0U)
         {
-            return TR_ERROR_EINVAL;
+            return make_result(TR_ERROR_EINVAL);
         }
 
-        auto const result = recalculate_hash(*this, id, tor->block_info(), piece);
-        if (!result.hash)
+        auto sha = tr_sha1{};
+        auto buffer = LocalData::BlockData{};
+        for (auto offset = uint64_t{}; offset < n_bytes;)
         {
-            return result.error != 0 ? result.error : EIO;
+            auto const len = static_cast<size_t>(std::min<uint64_t>(n_bytes - offset, buffer.capacity()));
+            buffer.resize(len);
+            if (auto result = tr_ioRead(plan, open_files_, offset, std::span{ std::data(buffer), len }); result.error)
+            {
+                return result;
+            }
+
+            sha.add(std::data(buffer), len);
+            offset += len;
         }
 
-        setme_hash = *result.hash;
-        return 0;
+        setme_hash = sha.finish();
+        return {};
     }
 
-    [[nodiscard]] tr_error_code_t write(
-        tr_torrent_id_t const id,
-        tr_byte_span_t const byte_span,
-        LocalData::BlockData const& data) override
+    [[nodiscard]] tr_io_result write(tr_io_plan const& plan, LocalData::BlockData const& data) override
     {
-        if (!byte_span.is_valid())
+        auto const len = plan.byte_span.is_valid() ? plan.byte_span.size() : 0U;
+        if (len > std::size(data))
         {
-            return TR_ERROR_EINVAL;
+            return make_result(TR_ERROR_EINVAL);
         }
 
-        auto* const tor = torrents_.get(id);
-        if (tor == nullptr)
-        {
-            return TR_ERROR_EINVAL;
-        }
-
-        auto const len = byte_span.size();
-        auto const span_size = static_cast<size_t>(len);
-        auto const loc = tor->byte_loc(byte_span.begin);
-        if (len == 0U || span_size > std::size(data) || loc.byte + len > tor->total_size())
-        {
-            return TR_ERROR_EINVAL;
-        }
-
-        return tr_ioWrite(*tor, open_files_, loc, std::span{ std::data(data), span_size });
+        return tr_ioWrite(plan, open_files_, std::span{ std::data(data), static_cast<size_t>(len) });
     }
 
     [[nodiscard]] tr_error_code_t move(
-        tr_torrent_id_t const id,
+        tr_torrent_id_t /*id*/,
+        tr_torrent_files const& files,
         std::string_view const old_parent,
         std::string_view const parent,
         std::string_view const parent_name) override
     {
-        auto* const tor = torrents_.get(id);
-        if (tor == nullptr)
-        {
-            return TR_ERROR_EINVAL;
-        }
-
         auto error = tr_error{};
-        if (tor->files().move(old_parent, parent, parent_name, &error))
+        if (files.move(old_parent, parent, parent_name, &error))
         {
             return 0;
         }
@@ -209,39 +145,26 @@ public:
         return error ? error.code() : EIO;
     }
 
-    [[nodiscard]] tr_error_code_t remove(tr_torrent_id_t const id, tr_torrent_remove_func remove_func) override
+    [[nodiscard]] tr_error remove(
+        tr_torrent_id_t /*id*/,
+        tr_torrent_files const& files,
+        std::string_view const parent,
+        std::string_view const name,
+        tr_torrent_remove_func const& remove_func) override
     {
-        auto* const tor = torrents_.get(id);
-        if (tor == nullptr)
-        {
-            return TR_ERROR_EINVAL;
-        }
-
-        if (!remove_func)
-        {
-            remove_func = tr_sys_path_remove;
-        }
-
         auto error = tr_error{};
-        tor->files().remove(tor->current_dir(), tor->name(), remove_func, &error);
-        return error ? error.code() : 0;
+        files.remove(parent, name, remove_func ? remove_func : tr_torrent_remove_func{ tr_sys_path_remove }, &error);
+        return error;
     }
 
     // Renames the path on disk only. The torrent's own record of its file
     // names is updated by the caller, on the session thread.
     [[nodiscard]] tr_error_code_t rename(
-        tr_torrent_id_t const id,
+        tr_torrent_id_t /*id*/,
+        std::string_view const base,
         std::string_view const oldpath,
         std::string_view const newname) override
     {
-        auto const* const tor = torrents_.get(id);
-        if (tor == nullptr)
-        {
-            return TR_ERROR_EINVAL;
-        }
-
-        auto const base = tor->is_done() || std::empty(tor->incomplete_dir()) ? tor->download_dir() :
-                                                                                tor->incomplete_dir();
         auto src = tr_pathbuf{ base, '/', oldpath };
         if (!tr_sys_path_exists(src))
         {
@@ -288,7 +211,6 @@ public:
 
 private:
     tr_open_files& open_files_;
-    tr_torrents const& torrents_;
 };
 
 } // namespace
@@ -364,25 +286,36 @@ public:
         shutdown();
     }
 
-    void read(tr_torrent_id_t id, tr_byte_span_t byte_span, OnRead on_read)
+    void read(tr_io_plan plan, OnRead on_read)
     {
         auto callback = std::make_shared<OnRead>(std::move(on_read));
+        auto const id = plan.tor_id;
+        auto const byte_span = plan.byte_span;
 
         auto task = Task{
             .id = id,
             .op = Op::Read,
             .run =
-                [this, id, byte_span, callback]()
+                [this, plan = std::move(plan), callback]()
             {
                 auto data = std::make_unique<BlockData>();
-                auto const err = backend_->read(id, byte_span, *data);
-                if (err != 0)
+                auto result = backend_->read(plan, *data);
+                if (result.error)
                 {
                     data.reset();
                 }
                 dispatch(
-                    [id, byte_span, callback, err, data = std::shared_ptr<BlockData>{ std::move(data) }]() mutable
-                    { (*callback)(id, byte_span, make_error(err), data ? std::make_unique<BlockData>(std::move(*data)) : nullptr); });
+                    [id = plan.tor_id,
+                     byte_span = plan.byte_span,
+                     name = plan.name,
+                     callback,
+                     result = std::move(result),
+                     data = std::shared_ptr<BlockData>{ std::move(data) }]() mutable
+                    {
+                        log_result(result, name);
+                        auto block = data ? std::make_unique<BlockData>(std::move(*data)) : nullptr;
+                        (*callback)(id, byte_span, result.error, std::move(block));
+                    });
             },
             .cancel = [this, id, byte_span, callback]()
             { dispatch([id, byte_span, callback]() { (*callback)(id, byte_span, make_error(ECANCELED), nullptr); }); },
@@ -391,20 +324,26 @@ public:
         enqueue(std::move(task));
     }
 
-    void test_piece(tr_torrent_id_t id, tr_piece_index_t piece, OnTest on_test)
+    void test_piece(tr_io_plan plan, tr_piece_index_t piece, OnTest on_test)
     {
         auto callback = std::make_shared<OnTest>(std::move(on_test));
+        auto const id = plan.tor_id;
 
         auto task = Task{
             .id = id,
             .op = Op::Test,
             .run =
-                [this, id, piece, callback]()
+                [this, plan = std::move(plan), piece, callback]()
             {
                 auto hash = tr_sha1_digest_t{};
-                auto const err = backend_->test_piece(id, piece, hash);
-                auto const maybe_hash = err == 0 ? std::optional<tr_sha1_digest_t>{ hash } : std::nullopt;
-                dispatch([id, piece, callback, err, maybe_hash]() { (*callback)(id, piece, make_error(err), maybe_hash); });
+                auto result = backend_->test_piece(plan, hash);
+                auto const maybe_hash = result.error ? std::nullopt : std::optional<tr_sha1_digest_t>{ hash };
+                dispatch(
+                    [id = plan.tor_id, name = plan.name, piece, callback, result = std::move(result), maybe_hash]()
+                    {
+                        log_result(result, name);
+                        (*callback)(id, piece, result.error, maybe_hash);
+                    });
             },
             .cancel = [this, id, piece, callback]()
             { dispatch([id, piece, callback]() { (*callback)(id, piece, make_error(ECANCELED), std::nullopt); }); },
@@ -413,13 +352,15 @@ public:
         enqueue(std::move(task));
     }
 
-    void write(tr_torrent_id_t id, tr_byte_span_t byte_span, std::unique_ptr<BlockData> data, OnWrite on_write)
+    void write(tr_io_plan plan, std::unique_ptr<BlockData> data, OnWrite on_write)
     {
         auto callback = std::make_shared<OnWrite>(std::move(on_write));
+        auto const id = plan.tor_id;
+        auto const byte_span = plan.byte_span;
 
         if (!byte_span.is_valid() || data == nullptr || byte_span.size() > std::size(*data))
         {
-            dispatch([id, byte_span, callback]() { (*callback)(id, byte_span, make_error(EINVAL)); });
+            dispatch([id, byte_span, callback]() { (*callback)(id, byte_span, make_error(EINVAL), false); });
             return;
         }
 
@@ -430,13 +371,18 @@ public:
             .op = Op::Write,
             .write_bytes = byte_span.size(),
             .run =
-                [this, id, byte_span, write_data, callback]()
+                [this, plan = std::move(plan), write_data, callback]()
             {
-                auto const err = backend_->write(id, byte_span, *write_data);
-                dispatch([id, byte_span, callback, err]() { (*callback)(id, byte_span, make_error(err)); });
+                auto result = backend_->write(plan, *write_data);
+                dispatch(
+                    [id = plan.tor_id, byte_span = plan.byte_span, name = plan.name, callback, result = std::move(result)]()
+                    {
+                        log_result(result, name);
+                        (*callback)(id, byte_span, result.error, result.created_file);
+                    });
             },
             .cancel = [this, id, byte_span, callback]()
-            { dispatch([id, byte_span, callback]() { (*callback)(id, byte_span, make_error(ECANCELED)); }); },
+            { dispatch([id, byte_span, callback]() { (*callback)(id, byte_span, make_error(ECANCELED), false); }); },
         };
 
         enqueue(std::move(task));
@@ -469,7 +415,12 @@ public:
         backend_->close_all();
     }
 
-    void rename(tr_torrent_id_t const tor_id, std::string_view oldpath, std::string_view newname, tr_torrent_rename_done_func callback)
+    void rename(
+        tr_torrent_id_t const tor_id,
+        std::string_view base,
+        std::string_view oldpath,
+        std::string_view newname,
+        tr_torrent_rename_done_func callback)
     {
         auto callback_ptr = std::make_shared<tr_torrent_rename_done_func>(std::move(callback));
         auto const oldpath_str = std::string{ oldpath };
@@ -489,10 +440,10 @@ public:
             .id = tor_id,
             .op = Op::Rename,
             .run =
-                [this, tor_id, oldpath_str, newname_str, notify]()
+                [this, tor_id, base = std::string{ base }, oldpath_str, newname_str, notify]()
             {
                 backend_->close_torrent(tor_id);
-                notify(backend_->rename(tor_id, oldpath_str, newname_str));
+                notify(backend_->rename(tor_id, base, oldpath_str, newname_str));
             },
             .cancel = [notify]() { notify(ECANCELED); },
         });
@@ -500,6 +451,7 @@ public:
 
     void move(
         tr_torrent_id_t const tor_id,
+        tr_torrent_files files,
         std::string_view old_parent,
         std::string_view parent,
         std::string_view parent_name,
@@ -515,19 +467,26 @@ public:
             .run =
                 [this,
                  tor_id,
+                 files = std::move(files),
                  old_parent = std::string{ old_parent },
                  parent = std::string{ parent },
                  parent_name = std::string{ parent_name },
                  notify]()
             {
                 backend_->close_torrent(tor_id);
-                notify(backend_->move(tor_id, old_parent, parent, parent_name));
+                notify(backend_->move(tor_id, files, old_parent, parent, parent_name));
             },
             .cancel = [notify]() { notify(ECANCELED); },
         });
     }
 
-    void remove(tr_torrent_id_t const tor_id, tr_torrent_remove_func remove_func)
+    void remove(
+        tr_torrent_id_t const tor_id,
+        tr_torrent_files files,
+        std::string_view parent,
+        std::string_view name,
+        tr_torrent_remove_func remove_func,
+        OnRemove on_remove)
     {
         auto canceled = std::vector<std::function<void()>>{};
 
@@ -535,10 +494,20 @@ public:
             .id = tor_id,
             .op = Op::Remove,
             .run =
-                [this, tor_id, remove_func = std::move(remove_func)]()
+                [this,
+                 tor_id,
+                 files = std::move(files),
+                 parent = std::string{ parent },
+                 name = std::string{ name },
+                 remove_func = std::move(remove_func),
+                 on_remove = std::move(on_remove)]()
             {
                 backend_->close_torrent(tor_id);
-                static_cast<void>(backend_->remove(tor_id, remove_func));
+                auto error = backend_->remove(tor_id, files, parent, name, remove_func);
+                if (on_remove)
+                {
+                    dispatch([tor_id, on_remove, error = std::move(error)]() { on_remove(tor_id, error); });
+                }
             },
             .cancel = {},
         };
@@ -547,20 +516,9 @@ public:
             auto const lock = std::lock_guard(mutex_);
 
             // The torrent's data is about to be deleted, so queued work on it is moot.
+            discard_queued_unlocked(tor_id, canceled);
+
             auto& queue = queues_[tor_id];
-            auto it = std::begin(queue);
-            while (it != std::end(queue))
-            {
-                if (it->op == Op::CloseFile || it->op == Op::CloseTorrent || it->op == Op::Remove)
-                {
-                    ++it;
-                    continue;
-                }
-
-                discard_unlocked(*it, canceled);
-                it = queue.erase(it);
-            }
-
             auto const was_empty = std::empty(queue);
             queue.emplace_back(std::move(task));
             ++pending_non_read_;
@@ -674,6 +632,31 @@ private:
         if (task.cancel)
         {
             canceled.emplace_back(std::move(task.cancel));
+        }
+    }
+
+    // Discards a torrent's queued tasks except closes and removes, which
+    // report to no one and must still run.
+    void discard_queued_unlocked(tr_torrent_id_t const tor_id, std::vector<std::function<void()>>& canceled)
+    {
+        auto const queue_it = queues_.find(tor_id);
+        if (queue_it == std::end(queues_))
+        {
+            return;
+        }
+
+        auto& queue = queue_it->second;
+        auto it = std::begin(queue);
+        while (it != std::end(queue))
+        {
+            if (it->op == Op::CloseFile || it->op == Op::CloseTorrent || it->op == Op::Remove)
+            {
+                ++it;
+                continue;
+            }
+
+            discard_unlocked(*it, canceled);
+            it = queue.erase(it);
         }
     }
 
@@ -855,8 +838,8 @@ private:
 
 // ---
 
-LocalData::LocalData(tr_torrents const& torrents, tr_open_files& open_files, Dispatcher dispatcher, size_t worker_count)
-    : impl_{ std::make_unique<Impl>(std::make_unique<DefaultBackend>(torrents, open_files), std::move(dispatcher), worker_count) }
+LocalData::LocalData(tr_open_files& open_files, Dispatcher dispatcher, size_t worker_count)
+    : impl_{ std::make_unique<Impl>(std::make_unique<DefaultBackend>(open_files), std::move(dispatcher), worker_count) }
 {
 }
 
@@ -867,23 +850,19 @@ LocalData::LocalData(std::unique_ptr<Backend> backend, Dispatcher dispatcher, si
 
 LocalData::~LocalData() = default;
 
-void LocalData::read(tr_torrent_id_t const id, tr_byte_span_t const byte_span, OnRead on_read)
+void LocalData::read(tr_io_plan plan, OnRead on_read)
 {
-    impl_->read(id, byte_span, std::move(on_read));
+    impl_->read(std::move(plan), std::move(on_read));
 }
 
-void LocalData::test_piece(tr_torrent_id_t const id, tr_piece_index_t const piece, OnTest on_test)
+void LocalData::test_piece(tr_io_plan plan, tr_piece_index_t const piece, OnTest on_test)
 {
-    impl_->test_piece(id, piece, std::move(on_test));
+    impl_->test_piece(std::move(plan), piece, std::move(on_test));
 }
 
-void LocalData::write(
-    tr_torrent_id_t const id,
-    tr_byte_span_t const byte_span,
-    std::unique_ptr<BlockData> data,
-    OnWrite on_write)
+void LocalData::write(tr_io_plan plan, std::unique_ptr<BlockData> data, OnWrite on_write)
 {
-    impl_->write(id, byte_span, std::move(data), std::move(on_write));
+    impl_->write(std::move(plan), std::move(data), std::move(on_write));
 }
 
 void LocalData::close_torrent(tr_torrent_id_t const tor_id)
@@ -903,26 +882,34 @@ void LocalData::close_all()
 
 void LocalData::move(
     tr_torrent_id_t const id,
+    tr_torrent_files files,
     std::string_view const old_parent,
     std::string_view const parent,
     std::string_view const parent_name,
     OnMove on_move)
 {
-    impl_->move(id, old_parent, parent, parent_name, std::move(on_move));
+    impl_->move(id, std::move(files), old_parent, parent, parent_name, std::move(on_move));
 }
 
-void LocalData::remove(tr_torrent_id_t const id, tr_torrent_remove_func remove_func)
+void LocalData::remove(
+    tr_torrent_id_t const id,
+    tr_torrent_files files,
+    std::string_view const parent,
+    std::string_view const name,
+    tr_torrent_remove_func remove_func,
+    OnRemove on_remove)
 {
-    impl_->remove(id, std::move(remove_func));
+    impl_->remove(id, std::move(files), parent, name, std::move(remove_func), std::move(on_remove));
 }
 
 void LocalData::rename(
     tr_torrent_id_t const id,
+    std::string_view const base,
     std::string_view const oldpath,
     std::string_view const newname,
     tr_torrent_rename_done_func callback)
 {
-    impl_->rename(id, oldpath, newname, std::move(callback));
+    impl_->rename(id, base, oldpath, newname, std::move(callback));
 }
 
 void LocalData::shutdown()

@@ -23,7 +23,9 @@
 
 #include <libtransmission/crypto-utils.h>
 #include <libtransmission/error.h>
+#include <libtransmission/inout.h>
 #include <libtransmission/local-data.h>
+#include <libtransmission/torrent-files.h>
 
 using namespace std::literals;
 
@@ -32,40 +34,58 @@ namespace
 
 auto constexpr WaitTimeout = 10s;
 
+[[nodiscard]] tr_io_plan make_plan(tr_torrent_id_t const tor_id, tr_byte_span_t const byte_span)
+{
+    auto plan = tr_io_plan{};
+    plan.tor_id = tor_id;
+    plan.byte_span = byte_span;
+    return plan;
+}
+
+[[nodiscard]] tr_io_result make_result(tr_error_code_t const err)
+{
+    auto result = tr_io_result{};
+    if (err != 0)
+    {
+        result.error.set(err, "stub error");
+    }
+    return result;
+}
+
 // A backend that records every call, and can block calls on a gate so a
 // test can control when each operation finishes.
 class StubBackend final : public tr::LocalData::Backend
 {
 public:
-    [[nodiscard]] tr_error_code_t read(tr_torrent_id_t tor_id, tr_byte_span_t byte_span, tr::LocalData::BlockData& setme)
-        override
+    [[nodiscard]] tr_io_result read(tr_io_plan const& plan, tr::LocalData::BlockData& setme) override
     {
-        auto const guard = Running{ *this, tor_id, "read" };
-        read_span = byte_span;
+        auto const guard = Running{ *this, plan.tor_id, "read" };
+        read_span = plan.byte_span;
         setme.assign({ uint8_t{ 1U }, uint8_t{ 2U }, uint8_t{ 3U } });
-        return read_err;
+        return make_result(read_err);
     }
 
-    [[nodiscard]] tr_error_code_t test_piece(tr_torrent_id_t tor_id, tr_piece_index_t piece, tr_sha1_digest_t& setme_hash)
-        override
+    [[nodiscard]] tr_io_result test_piece(tr_io_plan const& plan, tr_sha1_digest_t& setme_hash) override
     {
-        auto const guard = Running{ *this, tor_id, "test" };
-        tested_piece = piece;
+        auto const guard = Running{ *this, plan.tor_id, "test" };
+        tested_span = plan.byte_span;
         setme_hash = hash;
-        return test_err;
+        return make_result(test_err);
     }
 
-    [[nodiscard]] tr_error_code_t write(tr_torrent_id_t tor_id, tr_byte_span_t byte_span, tr::LocalData::BlockData const& data)
-        override
+    [[nodiscard]] tr_io_result write(tr_io_plan const& plan, tr::LocalData::BlockData const& data) override
     {
-        auto const guard = Running{ *this, tor_id, "write" };
-        write_span = byte_span;
+        auto const guard = Running{ *this, plan.tor_id, "write" };
+        write_span = plan.byte_span;
         last_write.assign(std::begin(data), std::end(data));
-        return write_err;
+        auto result = make_result(write_err);
+        result.created_file = write_creates_file;
+        return result;
     }
 
     [[nodiscard]] tr_error_code_t move(
         tr_torrent_id_t tor_id,
+        [[maybe_unused]] tr_torrent_files const& files,
         std::string_view old_parent,
         std::string_view parent,
         std::string_view parent_name) override
@@ -77,16 +97,28 @@ public:
         return move_err;
     }
 
-    [[nodiscard]] tr_error_code_t remove(tr_torrent_id_t tor_id, [[maybe_unused]] tr_torrent_remove_func remove_func) override
+    [[nodiscard]] tr_error remove(
+        tr_torrent_id_t tor_id,
+        [[maybe_unused]] tr_torrent_files const& files,
+        std::string_view parent,
+        std::string_view name,
+        [[maybe_unused]] tr_torrent_remove_func const& remove_func) override
     {
         auto const guard = Running{ *this, tor_id, "remove" };
+        removed_parent = std::string{ parent };
+        removed_name = std::string{ name };
         remove_called = true;
-        return remove_err;
+        return make_result(remove_err).error;
     }
 
-    [[nodiscard]] tr_error_code_t rename(tr_torrent_id_t tor_id, std::string_view oldpath, std::string_view newname) override
+    [[nodiscard]] tr_error_code_t rename(
+        tr_torrent_id_t tor_id,
+        std::string_view base,
+        std::string_view oldpath,
+        std::string_view newname) override
     {
         auto const guard = Running{ *this, tor_id, "rename" };
+        renamed_base = std::string{ base };
         renamed_from = std::string{ oldpath };
         renamed_to = std::string{ newname };
         return rename_err;
@@ -162,12 +194,16 @@ public:
     std::atomic<bool> close_all_called = false;
     tr_byte_span_t read_span{};
     tr_byte_span_t write_span{};
-    tr_piece_index_t tested_piece = 0;
+    tr_byte_span_t tested_span{};
+    bool write_creates_file = false;
     tr_sha1_digest_t hash = tr_sha1::digest("local-data-test"sv);
     std::vector<uint8_t> last_write;
     std::string moved_from;
     std::string moved_to;
     std::string moved_name;
+    std::string removed_parent;
+    std::string removed_name;
+    std::string renamed_base;
     std::string renamed_from;
     std::string renamed_to;
     std::atomic<tr_torrent_id_t> closed_torrent = -1;
@@ -247,8 +283,7 @@ TEST(LocalData, ReadCompletesThroughDispatcher)
     auto done = std::promise<void>{};
     auto done_future = done.get_future();
     local_data.read(
-        7,
-        { .begin = 10U, .end = 13U },
+        make_plan(7, { .begin = 10U, .end = 13U }),
         [&done, raw_backend](tr_torrent_id_t tor_id, tr_byte_span_t byte_span, tr_error const& error, auto data)
         {
             EXPECT_EQ(7, tor_id);
@@ -273,8 +308,7 @@ TEST(LocalData, ReadErrorYieldsNoData)
     auto done = std::promise<void>{};
     auto done_future = done.get_future();
     local_data.read(
-        7,
-        { .begin = 10U, .end = 13U },
+        make_plan(7, { .begin = 10U, .end = 13U }),
         [&done](tr_torrent_id_t, tr_byte_span_t, tr_error const& error, auto data)
         {
             EXPECT_TRUE(error);
@@ -295,13 +329,14 @@ TEST(LocalData, TestPieceReportsHash)
     auto done = std::promise<void>{};
     auto done_future = done.get_future();
     local_data.test_piece(
-        9,
+        make_plan(9, { .begin = 30U, .end = 40U }),
         3,
         [&done, raw_backend](tr_torrent_id_t tor_id, tr_piece_index_t piece, tr_error const& error, auto hash)
         {
             EXPECT_EQ(9, tor_id);
             EXPECT_EQ(3U, piece);
-            EXPECT_EQ(raw_backend->tested_piece, piece);
+            EXPECT_EQ(30U, raw_backend->tested_span.begin);
+            EXPECT_EQ(40U, raw_backend->tested_span.end);
             EXPECT_FALSE(error);
             ASSERT_TRUE(hash.has_value());
             EXPECT_EQ(raw_backend->hash, *hash);
@@ -316,6 +351,7 @@ TEST(LocalData, WriteDeliversDataAndAccountsBytes)
     auto backend = std::make_unique<StubBackend>();
     auto* raw_backend = backend.get();
     backend->hold(11);
+    backend->write_creates_file = true;
     auto local_data = tr::LocalData{ std::move(backend), {}, 1U };
 
     auto data = std::make_unique<tr::LocalData::BlockData>();
@@ -324,15 +360,15 @@ TEST(LocalData, WriteDeliversDataAndAccountsBytes)
     auto done = std::promise<void>{};
     auto done_future = done.get_future();
     local_data.write(
-        11,
-        { .begin = 20U, .end = 23U },
+        make_plan(11, { .begin = 20U, .end = 23U }),
         std::move(data),
-        [&done, raw_backend](tr_torrent_id_t tor_id, tr_byte_span_t byte_span, tr_error const& error)
+        [&done, raw_backend](tr_torrent_id_t tor_id, tr_byte_span_t byte_span, tr_error const& error, bool created_file)
         {
             EXPECT_EQ(11, tor_id);
             EXPECT_EQ(raw_backend->write_span.begin, byte_span.begin);
             EXPECT_EQ(raw_backend->write_span.end, byte_span.end);
             EXPECT_FALSE(error);
+            EXPECT_TRUE(created_file);
             EXPECT_EQ((std::vector<uint8_t>{ 4U, 5U, 6U }), raw_backend->last_write);
             done.set_value();
         });
@@ -359,10 +395,9 @@ TEST(LocalData, InvalidWriteFailsWithoutTouchingBackend)
     auto done = std::promise<void>{};
     auto done_future = done.get_future();
     local_data.write(
-        11,
-        { .begin = 20U, .end = 23U },
+        make_plan(11, { .begin = 20U, .end = 23U }),
         nullptr,
-        [&done](tr_torrent_id_t, tr_byte_span_t, tr_error const& error)
+        [&done](tr_torrent_id_t, tr_byte_span_t, tr_error const& error, bool /*created_file*/)
         {
             EXPECT_EQ(EINVAL, error.code());
             done.set_value();
@@ -383,6 +418,7 @@ TEST(LocalData, AdminOperationsDelegate)
     auto move_future = move_done.get_future();
     local_data.move(
         5,
+        {},
         "/old",
         "/new",
         "name",
@@ -401,6 +437,7 @@ TEST(LocalData, AdminOperationsDelegate)
     auto rename_future = rename_done.get_future();
     local_data.rename(
         8,
+        "/base",
         "old",
         "new",
         [&rename_done](tr_torrent_id_t tor_id, std::string_view oldpath, std::string_view newname, tr_error const& error)
@@ -412,10 +449,27 @@ TEST(LocalData, AdminOperationsDelegate)
             rename_done.set_value();
         });
     ASSERT_TRUE(wait_for(rename_future));
+    EXPECT_EQ("/base", raw_backend->renamed_base);
     EXPECT_EQ("old", raw_backend->renamed_from);
     EXPECT_EQ("new", raw_backend->renamed_to);
 
-    local_data.remove(12, {});
+    auto remove_done = std::promise<void>{};
+    auto remove_future = remove_done.get_future();
+    local_data.remove(
+        12,
+        {},
+        "/parent",
+        "name",
+        {},
+        [&remove_done](tr_torrent_id_t tor_id, tr_error const& error)
+        {
+            EXPECT_EQ(12, tor_id);
+            EXPECT_FALSE(error);
+            remove_done.set_value();
+        });
+    ASSERT_TRUE(wait_for(remove_future));
+    EXPECT_EQ("/parent", raw_backend->removed_parent);
+    EXPECT_EQ("name", raw_backend->removed_name);
     local_data.close_file(13, 2);
     local_data.close_torrent(14);
     local_data.close_all();
@@ -460,12 +514,15 @@ TEST(LocalData, SameTorrentRunsInOrderOneAtATime)
         }
     };
 
-    local_data.read(1, { .begin = 0U, .end = 3U }, [&](auto, auto, auto&, auto) { on_done("read1"); });
+    local_data.read(make_plan(1, { .begin = 0U, .end = 3U }), [&](auto, auto, auto&, auto) { on_done("read1"); });
     auto data = std::make_unique<tr::LocalData::BlockData>();
     data->assign({ uint8_t{ 1U } });
-    local_data.write(1, { .begin = 0U, .end = 1U }, std::move(data), [&](auto, auto, auto&) { on_done("write"); });
-    local_data.move(1, "/a", "/b", "n", [&](auto, auto&) { on_done("move"); });
-    local_data.read(1, { .begin = 3U, .end = 6U }, [&](auto, auto, auto&, auto) { on_done("read2"); });
+    local_data.write(
+        make_plan(1, { .begin = 0U, .end = 1U }),
+        std::move(data),
+        [&](auto, auto, auto&, auto) { on_done("write"); });
+    local_data.move(1, {}, "/a", "/b", "n", [&](auto, auto&) { on_done("move"); });
+    local_data.read(make_plan(1, { .begin = 3U, .end = 6U }), [&](auto, auto, auto&, auto) { on_done("read2"); });
 
     // the first read is blocked in the backend; nothing else may start
     ASSERT_TRUE(raw_backend->wait_until_running(1));
@@ -500,8 +557,8 @@ TEST(LocalData, DifferentTorrentsRunConcurrently)
         }
     };
 
-    local_data.read(1, { .begin = 0U, .end = 3U }, on_done);
-    local_data.read(2, { .begin = 0U, .end = 3U }, on_done);
+    local_data.read(make_plan(1, { .begin = 0U, .end = 3U }), on_done);
+    local_data.read(make_plan(2, { .begin = 0U, .end = 3U }), on_done);
 
     // both reads are blocked in the backend at the same time
     ASSERT_TRUE(raw_backend->wait_until_running(1));
@@ -522,24 +579,31 @@ TEST(LocalData, RemoveDiscardsQueuedWorkForThatTorrent)
 
     auto first_read = std::promise<tr_error_code_t>{};
     auto first_read_future = first_read.get_future();
-    local_data.read(1, { .begin = 0U, .end = 3U }, [&](auto, auto, tr_error const& error, auto) { first_read.set_value(error.code()); });
+    local_data.read(
+        make_plan(1, { .begin = 0U, .end = 3U }),
+        [&](auto, auto, tr_error const& error, auto) { first_read.set_value(error.code()); });
     ASSERT_TRUE(raw_backend->wait_until_running(1));
 
     auto write_result = std::promise<tr_error_code_t>{};
     auto write_future = write_result.get_future();
     auto data = std::make_unique<tr::LocalData::BlockData>();
     data->assign({ uint8_t{ 1U } });
-    local_data.write(1, { .begin = 0U, .end = 1U }, std::move(data), [&](auto, auto, tr_error const& error) { write_result.set_value(error.code()); });
+    local_data.write(
+        make_plan(1, { .begin = 0U, .end = 1U }),
+        std::move(data),
+        [&](auto, auto, tr_error const& error, auto) { write_result.set_value(error.code()); });
 
     auto move_result = std::promise<tr_error_code_t>{};
     auto move_future = move_result.get_future();
-    local_data.move(1, "/a", "/b", "n", [&](auto, tr_error const& error) { move_result.set_value(error.code()); });
+    local_data.move(1, {}, "/a", "/b", "n", [&](auto, tr_error const& error) { move_result.set_value(error.code()); });
 
     auto other_read = std::promise<tr_error_code_t>{};
     auto other_read_future = other_read.get_future();
-    local_data.read(2, { .begin = 0U, .end = 3U }, [&](auto, auto, tr_error const& error, auto) { other_read.set_value(error.code()); });
+    local_data.read(
+        make_plan(2, { .begin = 0U, .end = 3U }),
+        [&](auto, auto, tr_error const& error, auto) { other_read.set_value(error.code()); });
 
-    local_data.remove(1, {});
+    local_data.remove(1, {}, "/parent", "name", {}, {});
 
     // the queued write and move were discarded; the other torrent is untouched
     ASSERT_TRUE(wait_for(write_future));
@@ -570,12 +634,17 @@ TEST(LocalData, ShutdownDrainsWritesAndCancelsReads)
     auto write_future = write_result.get_future();
     auto data = std::make_unique<tr::LocalData::BlockData>();
     data->assign({ uint8_t{ 1U } });
-    local_data.write(1, { .begin = 0U, .end = 1U }, std::move(data), [&](auto, auto, tr_error const& error) { write_result.set_value(error.code()); });
+    local_data.write(
+        make_plan(1, { .begin = 0U, .end = 1U }),
+        std::move(data),
+        [&](auto, auto, tr_error const& error, auto) { write_result.set_value(error.code()); });
     ASSERT_TRUE(raw_backend->wait_until_running(1));
 
     auto read_result = std::promise<tr_error_code_t>{};
     auto read_future = read_result.get_future();
-    local_data.read(1, { .begin = 0U, .end = 3U }, [&](auto, auto, tr_error const& error, auto) { read_result.set_value(error.code()); });
+    local_data.read(
+        make_plan(1, { .begin = 0U, .end = 3U }),
+        [&](auto, auto, tr_error const& error, auto) { read_result.set_value(error.code()); });
 
     // shutdown blocks until the held write finishes, so release it from another thread
     auto releaser = std::thread(

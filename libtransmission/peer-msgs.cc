@@ -628,16 +628,14 @@ private:
 
     void schedule_peer_request_read(peer_request const& req)
     {
-        auto const tor_id = tor_.id();
         auto const byte_span = tor_.block_info().byte_span_for_req(req.index, req.offset, req.length);
         auto const weak = weak_from_this();
         auto* const session = this->session;
 
-        auto const enqueue_local_data_read = [byte_span, session, tor_id, weak](uint64_t const token)
+        auto const enqueue_local_data_read = [byte_span, session, weak](tr_torrent const& tor, uint64_t const token)
         {
             session->local_data.read(
-                tor_id,
-                byte_span,
+                tor.make_io_plan(byte_span),
                 [weak, session, token](
                     tr_torrent_id_t /*tor_id*/,
                     tr_byte_span_t /*byte_span*/,
@@ -661,14 +659,14 @@ private:
             auto const token = next_peer_request_token();
             pending_peer_read_tokens_.insert(token);
             peer_requested_.emplace_back(req, token, std::make_shared<tr::LocalData::BlockData>());
-            enqueue_local_data_read(token);
+            enqueue_local_data_read(tor_, token);
             return;
         }
 
         peer_requested_.emplace_back(req, 0U, std::make_shared<tr::LocalData::BlockData>());
 
         session->local_data.test_piece(
-            tor_id,
+            tor_.make_io_plan(tor_.block_info().byte_span_for_piece(req.index)),
             req.index,
             [weak, session, req, enqueue_local_data_read](
                 tr_torrent_id_t tor_id,
@@ -730,7 +728,7 @@ private:
                         auto const token = self->next_peer_request_token();
                         self->pending_peer_read_tokens_.insert(token);
                         it->token = token;
-                        enqueue_local_data_read(token);
+                        enqueue_local_data_read(*tor, token);
                     });
             });
     }
@@ -2065,11 +2063,17 @@ tr_error_code_t tr_peerMsgsImpl::client_got_block(
     active_requests.unset(block);
 
     session->local_data.write(
-        tor_.id(),
-        tor_.block_info().byte_span_for_block(block),
+        tor_.make_io_plan(tor_.block_info().byte_span_for_block(block)),
         std::move(block_data),
-        [session = session, msgs = this, event](tr_torrent_id_t, tr_byte_span_t, tr_error const&)
-        { session->run_in_session_thread([msgs, event]() { msgs->publish(event); }); });
+        [session = session, msgs = this, event](
+            tr_torrent_id_t tor_id,
+            tr_byte_span_t /*byte_span*/,
+            tr_error const& error,
+            bool created_file)
+        {
+            tr_torrent::on_local_write_done(*session, tor_id, error, created_file);
+            session->run_in_session_thread([msgs, event]() { msgs->publish(event); });
+        });
 
     return 0;
 }

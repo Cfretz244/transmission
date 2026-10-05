@@ -30,6 +30,7 @@
 #include "libtransmission/completion.h"
 #include "libtransmission/crypto-utils.h"
 #include "libtransmission/file-piece-map.h"
+#include "libtransmission/inout.h"
 #include "libtransmission/interned-string.h"
 #include "libtransmission/log.h"
 #include "libtransmission/session.h"
@@ -509,6 +510,10 @@ struct tr_torrent
 
     [[nodiscard]] bool has_any_local_data() const;
 
+    // Snapshots what LocalData needs to read or write `byte_span`.
+    // Call on the session thread. See tr_io_plan.
+    [[nodiscard]] tr_io_plan make_io_plan(tr_byte_span_t byte_span) const;
+
     /// METAINFO - TRACKERS
 
     [[nodiscard]] constexpr auto const& announce_list() const noexcept
@@ -982,6 +987,10 @@ struct tr_torrent
     }
 
     void on_block_received(tr_block_index_t block);
+
+    // Applies the outcome of a LocalData write to the session and, if it
+    // still exists, to the torrent. Call on the session thread.
+    static void on_local_write_done(tr_session& session, tr_torrent_id_t tor_id, tr_error const& error, bool created_file);
 
     [[nodiscard]] constexpr auto& error() noexcept
     {

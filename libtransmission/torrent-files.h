@@ -154,6 +154,9 @@ public:
     };
 
     [[nodiscard]] std::optional<FoundFile> find(tr_file_index_t file, std::string_view const* paths, size_t n_paths) const;
+
+    // Looks for `subpath`, with or without the partial-file suffix, under each of `paths`.
+    [[nodiscard]] static std::optional<FoundFile> find(std::string_view subpath, std::string_view const* paths, size_t n_paths);
     [[nodiscard]] bool has_any_local_data(std::string_view const* paths, size_t n_paths) const;
     [[nodiscard]] std::string_view primary_mime_type() const;
 

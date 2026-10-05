@@ -1145,6 +1145,7 @@ void tr_torrent::set_location(std::string_view location, bool move_from_old_path
             auto const top_name = std::string{ tor->name() };
             session->local_data.move(
                 tor_id,
+                tor->files(),
                 old_path,
                 path,
                 top_name,
@@ -1206,6 +1207,45 @@ std::optional<tr_torrent_files::FoundFile> tr_torrent::find_file(tr_file_index_t
     auto paths = std::array<std::string_view, 4>{};
     auto const n_paths = buildSearchPathArray(this, std::data(paths));
     return files().find(file_index, std::data(paths), n_paths);
+}
+
+tr_io_plan tr_torrent::make_io_plan(tr_byte_span_t const byte_span) const
+{
+    TR_ASSERT(session->am_in_session_thread());
+
+    auto plan = tr_io_plan{};
+    plan.tor_id = id();
+    plan.byte_span = byte_span;
+    plan.name = name();
+    plan.download_dir = download_dir().sv();
+    plan.incomplete_dir = incomplete_dir().sv();
+    plan.current_dir = current_dir().sv();
+    plan.prealloc = session->preallocationMode();
+    plan.incomplete_file_naming = session->isIncompleteFileNamingEnabled();
+
+    // An out-of-range span gets no files, so LocalData rejects it with EINVAL.
+    if (!byte_span.is_valid() || byte_span.end > total_size())
+    {
+        return plan;
+    }
+
+    auto [file_index, file_offset] = fpm_.file_offset(byte_span.begin);
+    for (auto n_left = byte_span.size(); n_left > 0U; ++file_index, file_offset = 0U)
+    {
+        auto const length = std::min(n_left, file_size(file_index) - file_offset);
+        if (length > 0U)
+        {
+            plan.files.push_back({ .index = file_index,
+                                   .offset = file_offset,
+                                   .length = length,
+                                   .size = file_size(file_index),
+                                   .subpath = file_subpath(file_index),
+                                   .wanted = file_is_wanted(file_index) });
+        }
+        n_left -= length;
+    }
+
+    return plan;
 }
 
 bool tr_torrent::has_any_local_data() const
@@ -2299,8 +2339,35 @@ void tr_torrent::on_block_received(tr_block_index_t const block)
         {
             ++n_pending_piece_tests_;
             pending_piece_test_bytes_ += piece_size(piece);
-            session->local_data.test_piece(id(), piece, on_tested);
+            session->local_data.test_piece(make_io_plan(block_info().byte_span_for_piece(piece)), piece, on_tested);
         }
+    }
+}
+
+void tr_torrent::on_local_write_done(
+    tr_session& session,
+    tr_torrent_id_t const tor_id,
+    tr_error const& error,
+    bool const created_file)
+{
+    TR_ASSERT(session.am_in_session_thread());
+
+    if (created_file)
+    {
+        session.add_file_created();
+    }
+
+    auto* const tor = session.torrents().get(tor_id);
+    if (tor == nullptr || !error || error.code() == ECANCELED)
+    {
+        return;
+    }
+
+    // if IO failed, set torrent's error if not already set
+    if (!tor->error().is_local_error())
+    {
+        tor->error().set_local_error(error.message());
+        tr_torrentStop(tor);
     }
 }
 

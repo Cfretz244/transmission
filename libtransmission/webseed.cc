@@ -400,13 +400,20 @@ void tr_webseed_task::use_fetched_blocks()
                  webseed = webseed_]()
                 {
                     webseed->active_requests.unset(block);
-                    auto on_written = [session, event, webseed](tr_torrent_id_t, tr_byte_span_t, tr_error const&)
+                    auto const* const torrent = session->torrents().get(tor_id);
+                    if (torrent == nullptr)
                     {
+                        return;
+                    }
+
+                    auto on_written =
+                        [session, event, webseed](tr_torrent_id_t id, tr_byte_span_t, tr_error const& error, bool created_file)
+                    {
+                        tr_torrent::on_local_write_done(*session, id, error, created_file);
                         session->run_in_session_thread([event, webseed]() { webseed->publish(event); });
                     };
                     session->local_data.write(
-                        tor_id,
-                        byte_span,
+                        torrent->make_io_plan(byte_span),
                         std::make_unique<tr::LocalData::BlockData>(std::move(*block_data)),
                         std::move(on_written));
                 });

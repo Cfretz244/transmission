@@ -123,8 +123,15 @@ std::optional<tr_torrent_files::FoundFile> tr_torrent_files::find(
     std::string_view const* paths,
     size_t n_paths) const
 {
+    return find(path(file_index), paths, n_paths);
+}
+
+std::optional<tr_torrent_files::FoundFile> tr_torrent_files::find(
+    std::string_view const subpath,
+    std::string_view const* paths,
+    size_t n_paths)
+{
     auto filename = tr_pathbuf{};
-    auto const& subpath = path(file_index);
 
     for (size_t path_idx = 0; path_idx < n_paths; ++path_idx)
     {

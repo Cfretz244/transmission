@@ -20,10 +20,11 @@
 
 #include "libtransmission/constants.h"
 #include "libtransmission/error-types.h"
+#include "libtransmission/inout.h"
+#include "libtransmission/torrent-files.h"
 #include "libtransmission/types.h"
 
 class tr_open_files;
-class tr_torrents;
 
 namespace tr
 {
@@ -46,6 +47,12 @@ namespace tr
  * callback without taking a lock or re-posting to the session thread.
  * A unit test may pass a dispatcher that runs the callback inline, in
  * which case it runs on the worker thread.
+ *
+ * Workers never touch a `tr_torrent`, `tr_torrents` or `tr_session`:
+ * the session thread may change or free a torrent while its I/O runs.
+ * Callers instead pass a snapshot of the torrent state that a task needs
+ * (a `tr_io_plan`, or a copy of `tr_torrent_files`), taken when they
+ * enqueue it.
  */
 class LocalData
 {
@@ -58,9 +65,13 @@ public:
     using OnTest = std::function<
         void(tr_torrent_id_t, tr_piece_index_t piece, tr_error const& error, std::optional<tr_sha1_digest_t> hash)>;
 
-    using OnWrite = std::function<void(tr_torrent_id_t, tr_byte_span_t byte_span, tr_error const& error)>;
+    // `created_file` is true if the write created a file that did not exist.
+    using OnWrite = std::function<
+        void(tr_torrent_id_t, tr_byte_span_t byte_span, tr_error const& error, bool created_file)>;
 
     using OnMove = std::function<void(tr_torrent_id_t, tr_error const& error)>;
+
+    using OnRemove = std::function<void(tr_torrent_id_t, tr_error const& error)>;
 
     // Runs a completion callback. See the class comment for the contract.
     using Dispatcher = std::function<void(std::function<void()>)>;
@@ -74,29 +85,33 @@ public:
     public:
         virtual ~Backend() = default;
 
-        [[nodiscard]] virtual tr_error_code_t read(tr_torrent_id_t tor_id, tr_byte_span_t byte_span, BlockData& setme) = 0;
-        [[nodiscard]] virtual tr_error_code_t test_piece(
-            tr_torrent_id_t tor_id,
-            tr_piece_index_t piece,
-            tr_sha1_digest_t& setme_hash) = 0;
-        [[nodiscard]] virtual tr_error_code_t write(
-            tr_torrent_id_t tor_id,
-            tr_byte_span_t byte_span,
-            BlockData const& data) = 0;
+        [[nodiscard]] virtual tr_io_result read(tr_io_plan const& plan, BlockData& setme) = 0;
+        [[nodiscard]] virtual tr_io_result test_piece(tr_io_plan const& plan, tr_sha1_digest_t& setme_hash) = 0;
+        [[nodiscard]] virtual tr_io_result write(tr_io_plan const& plan, BlockData const& data) = 0;
         [[nodiscard]] virtual tr_error_code_t move(
             tr_torrent_id_t id,
+            tr_torrent_files const& files,
             std::string_view old_parent,
             std::string_view parent,
             std::string_view parent_name) = 0;
-        [[nodiscard]] virtual tr_error_code_t remove(tr_torrent_id_t id, tr_torrent_remove_func remove_func) = 0;
-        [[nodiscard]] virtual tr_error_code_t rename(tr_torrent_id_t id, std::string_view oldpath, std::string_view newname) = 0;
+        [[nodiscard]] virtual tr_error remove(
+            tr_torrent_id_t id,
+            tr_torrent_files const& files,
+            std::string_view parent,
+            std::string_view name,
+            tr_torrent_remove_func const& remove_func) = 0;
+        [[nodiscard]] virtual tr_error_code_t rename(
+            tr_torrent_id_t id,
+            std::string_view base,
+            std::string_view oldpath,
+            std::string_view newname) = 0;
         virtual void close_all() = 0;
         virtual void close_torrent(tr_torrent_id_t tor_id) = 0;
         virtual void close_file(tr_torrent_id_t tor_id, tr_file_index_t file_num) = 0;
     };
 
     // `worker_count == 0` picks a default based on hardware concurrency.
-    LocalData(tr_torrents const& torrents, tr_open_files& open_files, Dispatcher dispatcher, size_t worker_count = {});
+    LocalData(tr_open_files& open_files, Dispatcher dispatcher, size_t worker_count = {});
     LocalData(std::unique_ptr<Backend> backend, Dispatcher dispatcher, size_t worker_count = {});
 
     LocalData(LocalData const&) = delete;
@@ -106,14 +121,17 @@ public:
 
     ~LocalData();
 
-    // Read a block.
-    void read(tr_torrent_id_t id, tr_byte_span_t byte_span, OnRead on_read);
+    // Read a block. `plan` covers the block's span.
+    // A failed read's log message is logged from the dispatcher.
+    void read(tr_io_plan plan, OnRead on_read);
 
-    // Read a piece and report its SHA1 checksum.
-    void test_piece(tr_torrent_id_t id, tr_piece_index_t piece, OnTest on_test);
+    // Read a piece and report its SHA1 checksum. `plan` covers the piece's span.
+    // A failed read's log message is logged from the dispatcher.
+    void test_piece(tr_io_plan plan, tr_piece_index_t piece, OnTest on_test);
 
-    // Write a block.
-    void write(tr_torrent_id_t id, tr_byte_span_t byte_span, std::unique_ptr<BlockData> data, OnWrite on_write);
+    // Write a block. `plan` covers the block's span.
+    // A failed write's log message is logged from the dispatcher.
+    void write(tr_io_plan plan, std::unique_ptr<BlockData> data, OnWrite on_write);
 
     // Close a torrent's files, e.g. so a finished download reopens them read-only.
     void close_torrent(tr_torrent_id_t tor_id);
@@ -127,17 +145,31 @@ public:
     // See tr_torrent_files::move()
     void move(
         tr_torrent_id_t id,
+        tr_torrent_files files,
         std::string_view old_parent,
         std::string_view parent,
         std::string_view parent_name,
         OnMove on_move);
 
-    // See tr_torrent_files::remove(). Discards the torrent's queued reads,
-    // writes, moves and renames first; their callbacks get ECANCELED.
-    void remove(tr_torrent_id_t id, tr_torrent_remove_func remove_func);
+    // See tr_torrent_files::remove(). Runs after the torrent's in-flight
+    // task, so no write can recreate a file after it is deleted.
+    // Discards the torrent's queued reads, tests, writes, moves and renames
+    // first; their callbacks get ECANCELED. `on_remove` may be empty.
+    void remove(
+        tr_torrent_id_t id,
+        tr_torrent_files files,
+        std::string_view parent,
+        std::string_view name,
+        tr_torrent_remove_func remove_func,
+        OnRemove on_remove);
 
-    // See tr_torrentRenamePath()
-    void rename(tr_torrent_id_t id, std::string_view oldpath, std::string_view newname, tr_torrent_rename_done_func callback);
+    // See tr_torrentRenamePath(). `base` is the directory that holds the torrent's files.
+    void rename(
+        tr_torrent_id_t id,
+        std::string_view base,
+        std::string_view oldpath,
+        std::string_view newname,
+        tr_torrent_rename_done_func callback);
 
     // Stops accepting reads and tests, cancels the queued ones, and blocks
     // until every queued write, move, rename and remove has run.

@@ -13,16 +13,12 @@
 
 #include <fmt/format.h>
 
-#include "libtransmission/block-info.h" // tr_block_info
-#include "libtransmission/crypto-utils.h"
 #include "libtransmission/error.h"
 #include "libtransmission/file.h"
 #include "libtransmission/inout.h"
 #include "libtransmission/open-files.h"
-#include "libtransmission/session.h"
 #include "libtransmission/string-utils.h"
 #include "libtransmission/torrent-files.h"
-#include "libtransmission/torrent.h"
 #include "libtransmission/tr-assert.h"
 #include "libtransmission/tr-strbuf.h" // tr_pathbuf
 #include "libtransmission/types.h"
@@ -71,196 +67,182 @@ bool write_entire_buf(tr_sys_file_t const fd, uint64_t file_offset, std::span<ui
 
 // The returned lease keeps the fd open; hold it until the I/O on that fd is done.
 [[nodiscard]] tr_open_files::Lease get_fd(
-    tr_session& session,
     tr_open_files& open_files,
-    tr_torrent const& tor,
+    tr_io_plan const& plan,
+    tr_io_plan::File const& file,
     bool const writable,
-    tr_file_index_t const file_index,
-    tr_error& error)
+    tr_io_result& result)
 {
-    auto const tor_id = tor.id();
-
     // is the file already open in the fd pool?
-    if (auto lease = open_files.get(tor_id, file_index, writable); lease)
+    if (auto lease = open_files.get(plan.tor_id, file.index, writable); lease)
     {
         return lease;
     }
 
     // does the file exist?
-    auto const file_size = tor.file_size(file_index);
-    auto const prealloc = writable && tor.file_is_wanted(file_index) ? session.preallocationMode() :
-                                                                       tr_file_preallocation::None;
-    if (auto const found = tor.find_file(file_index); found)
+    auto const prealloc = writable && file.wanted ? plan.prealloc : tr_file_preallocation::None;
+    auto paths = std::array<std::string_view, 2>{};
+    auto n_paths = size_t{};
+    for (auto const& dir : { std::string_view{ plan.download_dir }, std::string_view{ plan.incomplete_dir } })
     {
-        return open_files.get(tor_id, file_index, writable, found->filename(), prealloc, file_size);
+        if (!std::empty(dir))
+        {
+            paths[n_paths++] = dir;
+        }
+    }
+    if (auto const found = tr_torrent_files::find(file.subpath, std::data(paths), n_paths); found)
+    {
+        return open_files.get(plan.tor_id, file.index, writable, found->filename(), prealloc, file.size);
     }
 
     // do we want to create it?
     auto err = ENOENT;
     if (writable)
     {
-        auto const base = tor.current_dir();
-        auto const suffix = session.isIncompleteFileNamingEnabled() ? tr_torrent_files::PartialFileSuffix : ""sv;
-        auto const filename = tr_pathbuf{ base, '/', tor.file_subpath(file_index), suffix };
-        if (auto lease = open_files.get(tor_id, file_index, writable, filename, prealloc, file_size); lease)
+        auto const suffix = plan.incomplete_file_naming ? tr_torrent_files::PartialFileSuffix : ""sv;
+        auto const filename = tr_pathbuf{ plan.current_dir, '/', file.subpath, suffix };
+        if (auto lease = open_files.get(plan.tor_id, file.index, writable, filename, prealloc, file.size); lease)
         {
-            // make a note that we just created a file
-            session.add_file_created();
+            result.created_file = true;
             return lease;
         }
 
         err = errno;
     }
 
-    error.set(
+    result.error.set(
         err,
         fmt::format(
             fmt::runtime(_("Couldn't get '{path}': {error} ({error_code})")),
-            fmt::arg("path", tor.file_subpath(file_index)),
+            fmt::arg("path", file.subpath),
             fmt::arg("error", tr_strerror(err)),
             fmt::arg("error_code", err)));
     return {};
 }
 
 void read_bytes(
-    tr_session& session,
     tr_open_files& open_files,
-    tr_torrent const& tor,
-    tr_file_index_t const file_index,
+    tr_io_plan const& plan,
+    tr_io_plan::File const& file,
     uint64_t const file_offset,
     std::span<uint8_t> buf,
-    tr_error& error)
+    tr_io_result& result)
 {
-    TR_ASSERT(file_index < tor.file_count());
-    auto const file_size = tor.file_size(file_index);
-    TR_ASSERT(file_size == 0U || file_offset < file_size);
-    TR_ASSERT(file_offset + std::size(buf) <= file_size);
-    if (file_size == 0U)
+    TR_ASSERT(file_offset + std::size(buf) <= file.size);
+
+    auto const lease = get_fd(open_files, plan, file, false, result);
+    if (!lease || result.error)
     {
         return;
     }
 
-    auto const lease = get_fd(session, open_files, tor, false, file_index, error);
-    if (!lease || error)
+    if (auto& error = result.error; !read_entire_buf(lease.fd(), file_offset, buf, error))
     {
-        return;
-    }
-
-    read_entire_buf(lease.fd(), file_offset, buf, error);
-
-    if (error)
-    {
-        tr_logAddErrorTor(
-            &tor,
-            fmt::format(
-                fmt::runtime(_("Couldn't read '{path}': {error} ({error_code})")),
-                fmt::arg("path", tor.file_subpath(file_index)),
-                fmt::arg("error", error.message()),
-                fmt::arg("error_code", error.code())));
+        result.log_message = fmt::format(
+            fmt::runtime(_("Couldn't read '{path}': {error} ({error_code})")),
+            fmt::arg("path", file.subpath),
+            fmt::arg("error", error.message()),
+            fmt::arg("error_code", error.code()));
     }
 }
 
 void write_bytes(
-    tr_session& session,
     tr_open_files& open_files,
-    tr_torrent const& tor,
-    tr_file_index_t const file_index,
+    tr_io_plan const& plan,
+    tr_io_plan::File const& file,
     uint64_t const file_offset,
     std::span<uint8_t const> buf,
-    tr_error& error)
+    tr_io_result& result)
 {
-    TR_ASSERT(file_index < tor.file_count());
-    auto const file_size = tor.file_size(file_index);
-    TR_ASSERT(file_size == 0U || file_offset < file_size);
-    TR_ASSERT(file_offset + std::size(buf) <= file_size);
-    if (file_size == 0U)
+    TR_ASSERT(file_offset + std::size(buf) <= file.size);
+
+    auto const lease = get_fd(open_files, plan, file, true, result);
+    if (!lease || result.error)
     {
         return;
     }
 
-    auto const lease = get_fd(session, open_files, tor, true, file_index, error);
-    if (!lease || error)
+    if (auto& error = result.error; !write_entire_buf(lease.fd(), file_offset, buf, error))
     {
-        return;
+        result.log_message = fmt::format(
+            fmt::runtime(_("Couldn't save '{path}': {error} ({error_code})")),
+            fmt::arg("path", file.subpath),
+            fmt::arg("error", error.message()),
+            fmt::arg("error_code", error.code()));
+    }
+}
+
+// Whether [offset, offset + n_bytes) is a non-empty part of a plan whose files cover its whole span.
+[[nodiscard]] bool is_valid_request(tr_io_plan const& plan, uint64_t const offset, uint64_t const n_bytes)
+{
+    auto planned = uint64_t{};
+    for (auto const& file : plan.files)
+    {
+        planned += file.length;
     }
 
-    write_entire_buf(lease.fd(), file_offset, buf, error);
+    auto const span_size = plan.byte_span.is_valid() ? plan.byte_span.size() : 0U;
+    return n_bytes != 0U && planned == span_size && offset <= span_size && n_bytes <= span_size - offset;
+}
 
-    if (error)
-    {
-        tr_logAddErrorTor(
-            &tor,
-            fmt::format(
-                fmt::runtime(_("Couldn't save '{path}': {error} ({error_code})")),
-                fmt::arg("path", tor.file_subpath(file_index)),
-                fmt::arg("error", error.message()),
-                fmt::arg("error_code", error.code())));
-    }
+[[nodiscard]] tr_io_result make_einval()
+{
+    auto result = tr_io_result{};
+    result.error.set_from_errno(EINVAL);
+    return result;
 }
 } // namespace
 
-tr_error_code_t tr_ioRead(
-    tr_torrent const& tor,
-    tr_open_files& open_files,
-    tr_block_info::Location const& loc,
-    std::span<uint8_t> const setme)
+tr_io_result tr_ioRead(tr_io_plan const& plan, tr_open_files& open_files, uint64_t offset, std::span<uint8_t> const setme)
 {
-    auto error = tr_error{};
-
-    if (loc.piece >= tor.piece_count())
+    if (!is_valid_request(plan, offset, std::size(setme)))
     {
-        error.set_from_errno(EINVAL);
-        return error.code();
+        return make_einval();
     }
 
-    auto [file_index, file_offset] = tor.file_offset(loc);
-    auto& session = *tor.session;
+    auto result = tr_io_result{};
     auto buf = setme;
-    while (!std::empty(buf) && !error)
+    for (auto const& file : plan.files)
     {
-        auto const bytes_this_pass = std::min<uint64_t>(std::size(buf), tor.file_size(file_index) - file_offset);
-        read_bytes(session, open_files, tor, file_index, file_offset, buf.first(bytes_this_pass), error);
+        if (std::empty(buf) || result.error)
+        {
+            break;
+        }
+
+        if (offset >= file.length)
+        {
+            offset -= file.length;
+            continue;
+        }
+
+        auto const bytes_this_pass = std::min<uint64_t>(std::size(buf), file.length - offset);
+        read_bytes(open_files, plan, file, file.offset + offset, buf.first(bytes_this_pass), result);
         buf = buf.subspan(bytes_this_pass);
-        ++file_index;
-        file_offset = 0U;
+        offset = 0U;
     }
 
-    return error.code();
+    return result;
 }
 
-tr_error_code_t tr_ioWrite(
-    tr_torrent& tor,
-    tr_open_files& open_files,
-    tr_block_info::Location const& loc,
-    std::span<uint8_t const> const writeme)
+tr_io_result tr_ioWrite(tr_io_plan const& plan, tr_open_files& open_files, std::span<uint8_t const> const writeme)
 {
-    auto error = tr_error{};
-
-    if (loc.piece >= tor.piece_count())
+    if (!is_valid_request(plan, 0U, std::size(writeme)) || std::size(writeme) != plan.byte_span.size())
     {
-        error.set_from_errno(EINVAL);
+        return make_einval();
     }
-    else
+
+    auto result = tr_io_result{};
+    auto buf = writeme;
+    for (auto const& file : plan.files)
     {
-        auto [file_index, file_offset] = tor.file_offset(loc);
-        auto& session = *tor.session;
-        auto buf = writeme;
-        while (!std::empty(buf) && !error)
+        if (result.error)
         {
-            auto const bytes_this_pass = std::min<uint64_t>(std::size(buf), tor.file_size(file_index) - file_offset);
-            write_bytes(session, open_files, tor, file_index, file_offset, buf.first(bytes_this_pass), error);
-            buf = buf.subspan(bytes_this_pass);
-            ++file_index;
-            file_offset = 0U;
+            break;
         }
+
+        write_bytes(open_files, plan, file, file.offset, buf.first(file.length), result);
+        buf = buf.subspan(file.length);
     }
 
-    // if IO failed, set torrent's error if not already set
-    if (error && !tor.error().is_local_error())
-    {
-        tor.error().set_local_error(error.message());
-        tr_torrentStop(&tor);
-    }
-
-    return error.code();
+    return result;
 }

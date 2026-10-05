@@ -1303,10 +1303,8 @@ private:
     tr_torrents torrents_;
 
 public:
-    // depends-on: open_files_, torrents_, session_thread_
-    tr::LocalData local_data{ torrents_,
-                              open_files_,
-                              [this](std::function<void()> func) { run_in_session_thread(std::move(func)); } };
+    // depends-on: open_files_, session_thread_
+    tr::LocalData local_data{ open_files_, [this](std::function<void()> func) { run_in_session_thread(std::move(func)); } };
 
 private:
     // depends-on: settings_, session_thread_, timer_maker_, web_
