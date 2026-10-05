@@ -376,8 +376,15 @@ void handle_rpc_from_json(struct evhttp_request* req, tr_rpc_server* server, std
         server->session,
         json,
         // NOLINTNEXTLINE(cppcoreguidelines-rvalue-reference-param-not-moved)
-        [req, server](tr_variant&& content)
+        [req, server, alive = server->httpd_alive](tr_variant&& content)
         {
+            if (!*alive)
+            {
+                // the listener that owned `req` is gone (session close or an
+                // RPC restart), and took the request with it
+                return;
+            }
+
             if (!content.has_value())
             {
                 evhttp_send_reply(req, HTTP_NOCONTENT, "OK", nullptr);
@@ -803,6 +810,7 @@ void start_server(tr_rpc_server* server)
 
     auto* const base = server->session->event_base();
     auto* const httpd = evhttp_new(base);
+    server->httpd_alive = std::make_shared<bool>(true);
 
     evhttp_set_allowed_methods(httpd, EVHTTP_REQ_GET | EVHTTP_REQ_POST | EVHTTP_REQ_OPTIONS);
 
@@ -864,6 +872,10 @@ void stop_server(tr_rpc_server* server)
 
     auto const address = server->get_bind_address();
 
+    if (server->httpd_alive)
+    {
+        *server->httpd_alive = false;
+    }
     httpd.reset();
 
     if (server->bind_address_->is_unix_addr())

@@ -148,6 +148,11 @@ public:
 
     std::unique_ptr<tr::Timer> start_retry_timer;
     tr::evhelpers::evhttp_unique_ptr httpd;
+    // True while `httpd` is the listener a request came in on. Freeing the
+    // listener frees its pending requests, so a reply to an async method
+    // (rename-path, port-test, torrent-add by URL, blocklist-update) that
+    // lands after that must not touch its request. Replaced on every start.
+    std::shared_ptr<bool> httpd_alive;
     tr_session* const session;
 
     size_t login_attempts_ = 0U;

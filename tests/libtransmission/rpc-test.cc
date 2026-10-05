@@ -7,17 +7,36 @@
 #include <array>
 #include <cstddef> // size_t
 #include <cstdint> // int64_t
+#include <cerrno>
+#include <chrono>
 #include <future>
+#include <string>
+#include <thread>
 #include <iterator> // std::inserter
 #include <set>
 #include <string_view>
 #include <vector>
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/stat.h> // mkfifo()
+#include <unistd.h>
+#endif
+
+#include <fmt/format.h>
 #include <gtest/gtest.h>
 
 #include <libtransmission/quark.h>
 #include <libtransmission/transmission.h>
+#include <libtransmission/file.h>
+#include <libtransmission/local-data.h>
 #include <libtransmission/rpcimpl.h>
+#include <libtransmission/session.h>
+#include <libtransmission/torrent.h>
+#include <libtransmission/tr-strbuf.h>
+#include <libtransmission/string-utils.h> // tr_strerror()
 #include <libtransmission/variant.h>
 
 #include "test-fixtures.h"
@@ -246,6 +265,152 @@ TEST_F(RpcTest, tagSyncLegacy)
     ASSERT_TRUE(tag);
     EXPECT_EQ(*tag, 12345);
 }
+
+#ifndef _WIN32
+namespace
+{
+int connectLoopback(uint16_t port)
+{
+    auto const sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == -1)
+    {
+        return -1;
+    }
+    auto addr = sockaddr_in{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(sock, reinterpret_cast<sockaddr const*>(&addr), sizeof(addr)) != 0)
+    {
+        close(sock);
+        return -1;
+    }
+    auto tv = timeval{ 10, 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    return sock;
+}
+
+// Reads until EOF or the receive timeout.
+std::string readAll(int sock)
+{
+    auto out = std::string{};
+    auto buf = std::array<char, 4096>{};
+    for (;;)
+    {
+        auto const n = read(sock, std::data(buf), std::size(buf));
+        if (n <= 0)
+        {
+            return out;
+        }
+        out.append(std::data(buf), static_cast<size_t>(n));
+    }
+}
+
+void sendHttpPost(int sock, uint16_t port, std::string_view session_id, std::string_view body)
+{
+    auto const req = fmt::format(
+        "POST /transmission/rpc HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-Transmission-Session-Id: {}\r\n"
+        "Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        port,
+        session_id,
+        std::size(body),
+        body);
+    ASSERT_EQ(static_cast<ssize_t>(std::size(req)), write(sock, std::data(req), std::size(req)));
+}
+} // namespace
+
+// An async RPC (here rename-path, held up behind a stalled disk queue) can
+// finish after the session has started closing. The reply must not touch the
+// HTTP request, which the RPC listener freed when it went down: without the
+// liveness check this is a use-after-free that ASan catches.
+TEST_F(RpcTest, asyncHttpReplyLandingDuringCloseIsDropped)
+{
+    // an RPC listener on a free loopback port
+    auto const port = []()
+    {
+        auto const sock = socket(AF_INET, SOCK_STREAM, 0);
+        auto addr = sockaddr_in{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        bind(sock, reinterpret_cast<sockaddr const*>(&addr), sizeof(addr));
+        auto len = socklen_t{ sizeof(addr) };
+        getsockname(sock, reinterpret_cast<sockaddr*>(&addr), &len);
+        close(sock);
+        return ntohs(addr.sin_port);
+    }();
+    tr_sessionSetRPCPort(session_, port);
+    tr_sessionSetRPCEnabled(session_, true);
+    ASSERT_TRUE(waitFor(
+        [port]()
+        {
+            auto const sock = connectLoopback(port);
+            if (sock == -1)
+            {
+                return false;
+            }
+            close(sock);
+            return true;
+        },
+        5000));
+
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Complete);
+    ASSERT_NE(nullptr, tor);
+
+    // stall the torrent's disk queue: a read whose "file" is a FIFO with no
+    // writer blocks in open() until the test opens the other end
+    auto const fifo_name = "stall.fifo"sv;
+    auto const fifo_path = tr_pathbuf{ tr_sessionGetDownloadDir(session_), '/', fifo_name };
+    ASSERT_EQ(0, mkfifo(fifo_path.c_str(), 0600)) << tr_strerror(errno);
+    auto stall_plan = makeIoPlan(tor);
+    ASSERT_EQ(1U, std::size(stall_plan.files));
+    stall_plan.files[0].index = tor->file_count() + 1U;
+    stall_plan.files[0].subpath = fifo_name;
+    session_->local_data.read(
+        std::move(stall_plan),
+        [](tr_torrent_id_t, tr_byte_span_t, tr_error const&, std::unique_ptr<tr::LocalData::BlockData>) {});
+
+    // get a session id
+    auto sock = connectLoopback(port);
+    ASSERT_NE(-1, sock);
+    sendHttpPost(sock, port, "", R"({"method":"session-get"})");
+    auto const first = readAll(sock);
+    close(sock);
+    auto const key = "X-Transmission-Session-Id: "sv;
+    auto const key_pos = first.find(key);
+    ASSERT_NE(std::string::npos, key_pos) << first;
+    auto const id_begin = key_pos + std::size(key);
+    auto const session_id = first.substr(id_begin, first.find("\r\n", id_begin) - id_begin);
+
+    // the rename queues behind the stall; no reply can come yet
+    sock = connectLoopback(port);
+    ASSERT_NE(-1, sock);
+    sendHttpPost(
+        sock,
+        port,
+        session_id,
+        fmt::format(
+            R"({{"method":"torrent-rename-path","arguments":{{"ids":[{}],"path":"files-filled-with-zeroes/512","name":"renamed"}}}})",
+            tor->id()));
+    std::this_thread::sleep_for(std::chrono::milliseconds{ 300 });
+
+    // close the session while it is pending, then release the stall so the
+    // rename (or its cancellation) delivers its reply during the close
+    auto closer = std::thread{ [this]()
+                               {
+                                   closeSession();
+                               } };
+    std::this_thread::sleep_for(std::chrono::milliseconds{ 300 });
+    auto const writer = open(fifo_path.c_str(), O_WRONLY);
+    ASSERT_NE(-1, writer) << tr_strerror(errno);
+    close(writer);
+    closer.join();
+
+    // the connection went down with the listener: no reply, no crash
+    auto const rest = readAll(sock);
+    close(sock);
+    EXPECT_EQ(std::string::npos, rest.find("HTTP/1.1 200")) << rest;
+}
+#endif
 
 TEST_F(RpcTest, idAsync)
 {
