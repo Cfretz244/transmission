@@ -840,4 +840,44 @@ TEST_F(MoveTest, setLocation)
     tr_torrentRemove(tor, true);
 }
 
+// Two moves queued back to back, A->B then B->C, where the move to B
+// fails (B is a file, not a directory). The torrent must end up pointing
+// where its files actually are: a move planned from the dirs a failed
+// move had set would find nothing to move and "succeed", leaving the
+// torrent at C with its files still at A.
+TEST_F(MoveTest, moveQueuedBehindAFailedMoveStartsFromWhereTheFilesAre)
+{
+    auto const dir_a = std::string{ tr_sessionGetDownloadDir(session_) };
+    auto const not_a_dir = tr_pathbuf{ session_->configDir(), "/not-a-dir"sv };
+    createFileWithContents(not_a_dir, "x");
+    auto const dir_c = tr_pathbuf{ session_->configDir(), "/target"sv };
+
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Complete);
+    blockingTorrentVerify(tor);
+    EXPECT_EQ(0, tr_torrentStat(tor).left_until_done);
+
+    auto state_b = -1;
+    auto state_c = -1;
+    tr_torrentSetLocation(tor, not_a_dir, true, &state_b);
+    tr_torrentSetLocation(tor, dir_c, true, &state_c);
+    EXPECT_TRUE(waitFor([&state_b, &state_c]() { return state_b != TR_LOC_MOVING && state_c != TR_LOC_MOVING; }, MaxWaitMsec));
+    EXPECT_EQ(TR_LOC_ERROR, state_b);
+    EXPECT_EQ(TR_LOC_DONE, state_c);
+
+    // the second move started from A, where the files were, and landed them in C
+    sync();
+    EXPECT_EQ(dir_c, tor->download_dir());
+    auto const n = tr_torrentFileCount(tor);
+    for (tr_file_index_t i = 0; i < n; ++i)
+    {
+        auto const expected = tr_pathbuf{ dir_c, '/', tr_torrentFile(tor, i).name };
+        EXPECT_EQ(expected, tr_torrentFindFile(tor, i));
+    }
+    blockingTorrentVerify(tor);
+    EXPECT_EQ(0, tr_torrentStat(tor).left_until_done);
+
+    // cleanup
+    tr_torrentRemove(tor, true);
+}
+
 } // namespace tr::test

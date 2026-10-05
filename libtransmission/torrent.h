@@ -11,6 +11,7 @@
 
 #include <cstddef> // size_t
 #include <cstdint> // uint64_t, uint16_t
+#include <deque>
 #include <ctime>
 #include <functional>
 #include <memory>
@@ -182,6 +183,16 @@ struct tr_torrent
     }
 
     void set_location(std::string_view location, bool move_from_old_path, int volatile* setme_state);
+
+    // Moves wait here and run one at a time, each planned from where the
+    // files are when it starts. See set_location().
+    struct PendingMove
+    {
+        std::string path;
+        int volatile* setme_state = nullptr;
+    };
+    std::deque<PendingMove> pending_moves_;
+    void start_next_move();
 
     void rename_path(std::string_view oldpath, std::string_view newname, tr_torrent_rename_done_func&& callback);
 

@@ -1307,74 +1307,101 @@ void tr_torrent::set_location(std::string_view location, bool move_from_old_path
                 return;
             }
 
-            session->verify_remove(tor);
-
-            auto old_path = std::string{ tor->current_dir() };
-            auto const top_name = std::string{ tor->name() };
-            auto const old_download_dir = tor->download_dir_;
-            auto const old_incomplete_dir = tor->incomplete_dir_;
-            auto const old_current_dir = tor->current_dir_;
-            session->local_data.move(
-                tor_id,
-                tor->files(),
-                old_path,
-                path,
-                top_name,
-                [session,
-                 tor_id,
-                 path,
-                 old_path = std::move(old_path),
-                 old_download_dir,
-                 old_incomplete_dir,
-                 old_current_dir,
-                 setme_state](tr_torrent_id_t, tr_error const& error) mutable
-                {
-                    auto lock = session->unique_lock();
-                    auto* const tor = session->torrents().get(tor_id);
-                    if (!tor)
-                    {
-                        return;
-                    }
-
-                    if (error)
-                    {
-                        tor->download_dir_ = old_download_dir;
-                        tor->incomplete_dir_ = old_incomplete_dir;
-                        tor->current_dir_ = old_current_dir;
-                        tor->error().set_local_error(
-                            fmt::format(
-                                fmt::runtime(_("Couldn't move '{old_path}' to '{path}': {error} ({error_code})")),
-                                fmt::arg("old_path", old_path),
-                                fmt::arg("path", path),
-                                fmt::arg("error", error.message()),
-                                fmt::arg("error_code", error.code())));
-                        tr_torrentStop(tor);
-
-                        if (setme_state != nullptr)
-                        {
-                            *setme_state = TR_LOC_ERROR;
-                        }
-
-                        return;
-                    }
-
-                    tor->set_download_dir(path);
-                    tor->incomplete_dir_.clear();
-                    tor->current_dir_ = tor->download_dir();
-
-                    if (setme_state != nullptr)
-                    {
-                        *setme_state = TR_LOC_DONE;
-                    }
-                });
-
-            // Point the torrent at the destination now. LocalData runs the torrent's
-            // tasks in order, so I/O planned from here on runs after the move and
-            // must use the new paths; the callback reverts them if the move fails.
-            tor->download_dir_ = path;
-            tor->incomplete_dir_.clear();
-            tor->current_dir_ = tor->download_dir_;
+            // One move at a time. A move is planned from the torrent's
+            // current dirs, which an in-flight move has already pointed at
+            // its destination; if that move fails, a second one planned
+            // behind it would find nothing there to move and "succeed",
+            // leaving the torrent pointing away from its files.
+            tor->pending_moves_.emplace_back(PendingMove{ std::move(path), setme_state });
+            if (std::size(tor->pending_moves_) == 1U)
+            {
+                tor->start_next_move();
+            }
         });
+}
+
+void tr_torrent::start_next_move()
+{
+    TR_ASSERT(session->am_in_session_thread());
+    TR_ASSERT(!std::empty(pending_moves_));
+
+    auto const tor_id = id();
+    auto const& path = pending_moves_.front().path;
+    auto* const setme_state = pending_moves_.front().setme_state;
+
+    session->verify_remove(this);
+
+    auto old_path = std::string{ current_dir() };
+    auto const top_name = std::string{ name() };
+    auto const old_download_dir = download_dir_;
+    auto const old_incomplete_dir = incomplete_dir_;
+    auto const old_current_dir = current_dir_;
+    session->local_data.move(
+        tor_id,
+        files(),
+        old_path,
+        path,
+        top_name,
+        [session = this->session,
+         tor_id,
+         path,
+         old_path = std::move(old_path),
+         old_download_dir,
+         old_incomplete_dir,
+         old_current_dir,
+         setme_state](tr_torrent_id_t, tr_error const& error) mutable
+        {
+            auto lock = session->unique_lock();
+            auto* const tor = session->torrents().get(tor_id);
+            if (!tor)
+            {
+                return;
+            }
+
+            if (error)
+            {
+                tor->download_dir_ = old_download_dir;
+                tor->incomplete_dir_ = old_incomplete_dir;
+                tor->current_dir_ = old_current_dir;
+                tor->error().set_local_error(
+                    fmt::format(
+                        fmt::runtime(_("Couldn't move '{old_path}' to '{path}': {error} ({error_code})")),
+                        fmt::arg("old_path", old_path),
+                        fmt::arg("path", path),
+                        fmt::arg("error", error.message()),
+                        fmt::arg("error_code", error.code())));
+                tr_torrentStop(tor);
+
+                if (setme_state != nullptr)
+                {
+                    *setme_state = TR_LOC_ERROR;
+                }
+            }
+            else
+            {
+                tor->set_download_dir(path);
+                tor->incomplete_dir_.clear();
+                tor->current_dir_ = tor->download_dir();
+
+                if (setme_state != nullptr)
+                {
+                    *setme_state = TR_LOC_DONE;
+                }
+            }
+
+            tor->pending_moves_.pop_front();
+            if (!std::empty(tor->pending_moves_) && !session->isClosing())
+            {
+                tor->start_next_move();
+            }
+        });
+
+    // Point the torrent at the destination now. LocalData runs the torrent's
+    // tasks in order, so I/O planned from here on runs after the move and
+    // must use the new paths; the callback reverts them if the move fails.
+    download_dir_ = path;
+    incomplete_dir_.clear();
+    current_dir_ = download_dir_;
 }
 
 void tr_torrentSetLocation(tr_torrent* tor, char const* location, bool move_from_old_path, int volatile* setme_state)
