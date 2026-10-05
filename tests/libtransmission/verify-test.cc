@@ -101,4 +101,43 @@ TEST_F(VerifyTest, stopDoesNotWaitForAStalledVerify)
 #endif
 }
 
+// tr_torrentVerify() used to stat every file on the session thread first
+// to decide whether the data had disappeared. The verify thread learns the
+// same thing while walking the files, and the end state is unchanged: a
+// torrent that had data and finds none of its files stays paused with a
+// local error instead of re-downloading over a missing drive.
+TEST_F(VerifyTest, torrentWhoseFilesDisappearedIsPausedWithAnError)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Complete);
+    blockingTorrentVerify(tor);
+    ASSERT_TRUE(tor->has_all());
+    ASSERT_FALSE(tor->error().is_local_error());
+
+    for (tr_file_index_t i = 0, n = tor->file_count(); i < n; ++i)
+    {
+        auto const found = tor->find_file(i);
+        ASSERT_TRUE(found);
+        ASSERT_TRUE(tr_sys_path_remove(found->filename()));
+    }
+
+    tr_torrentStart(tor);
+    blockingTorrentVerify(tor);
+
+    EXPECT_TRUE(tor->has_none());
+    EXPECT_TRUE(tor->error().is_local_error());
+    EXPECT_TRUE(waitFor([tor]() { return tor->activity() == TR_STATUS_STOPPED; }, 5s));
+}
+
+// ...but a torrent that never had data is simply verified and may start.
+TEST_F(VerifyTest, newTorrentWithNoFilesIsNotAnError)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::NoFiles);
+    EXPECT_TRUE(tor->has_none());
+    EXPECT_FALSE(tor->error().is_local_error());
+
+    blockingTorrentVerify(tor);
+    EXPECT_TRUE(tor->has_none());
+    EXPECT_FALSE(tor->error().is_local_error());
+}
+
 } // namespace tr::test

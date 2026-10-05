@@ -57,19 +57,22 @@ void writeFilesAs(tr_torrent_metainfo const& metainfo, std::string_view dir, cha
 // A torrent added over files that look complete (right names, sizes and
 // mtimes) skips the full verify, but only after hashing its first piece.
 // Without that hash, a cross-seeded release with different bytes announces
-// itself to the tracker as a complete seed.
+// itself to the tracker as a complete seed. The stats and the hash run on
+// the verify thread, so the result arrives after tr_torrentNew() returns.
 TEST_F(TorrentTest, addedTorrentWithMatchingFilesIsASeedWithoutVerify)
 {
     auto* const ctor = zeroTorrentCtor();
     writeFilesAs(*tr_ctorGetMetainfo(ctor), tr_sessionGetDownloadDir(session_), '\0');
 
-    auto* const tor = tr_torrentNew(ctor, nullptr);
+    auto* const tor = createTorrentAndWaitForVerifyDone(ctor);
     tr_ctorFree(ctor);
     ASSERT_NE(nullptr, tor);
 
     EXPECT_TRUE(tor->is_piece_checked(0U));
+    EXPECT_FALSE(tor->is_piece_checked(1U)); // held, but only the first piece was hashed
     EXPECT_TRUE(tor->has_all());
     EXPECT_TRUE(tor->is_done());
+    EXPECT_NE(TR_STATUS_CHECK, tor->activity());
 }
 
 TEST_F(TorrentTest, addedTorrentWithWrongContentIsNotASeed)

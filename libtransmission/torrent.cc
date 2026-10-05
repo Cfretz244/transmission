@@ -878,69 +878,6 @@ void tr_torrentFreeInSessionThread(tr_torrent* tor)
 
 // ---
 
-// Sniff out newly-added seeds so that they can skip the verify step
-bool tr_torrent::is_new_torrent_a_seed()
-{
-    if (!has_metainfo())
-    {
-        return false;
-    }
-
-    for (tr_file_index_t i = 0, n = file_count(); i < n; ++i)
-    {
-        // it's not a new seed if a file is missing
-        auto const found = find_file(i);
-        if (!found)
-        {
-            return false;
-        }
-
-        // it's not a new seed if a file is partial
-        if (tr_strv_ends_with(found->filename(), tr_torrent_files::PartialFileSuffix))
-        {
-            return false;
-        }
-
-        // it's not a new seed if a file size is wrong
-        if (found->size != file_size(i))
-        {
-            return false;
-        }
-
-        // it's not a new seed if it was modified after it was added
-        if (found->last_modified_at >= date_added_)
-        {
-            return false;
-        }
-    }
-
-    // Same-named files of the right size may still hold other content
-    // (e.g. a different release of the same title), and a torrent that
-    // skips the verify step announces `left=0` on the strength of this
-    // check alone. Hash the first piece before believing the metadata.
-    // Nothing is queued for a torrent this new, so the synchronous read
-    // cannot reorder against the LocalData FIFO.
-    return check_piece_now(0U);
-}
-
-bool tr_torrent::check_piece_now(tr_piece_index_t const piece)
-{
-    TR_ASSERT(session->am_in_session_thread());
-    TR_ASSERT(piece < piece_count());
-
-    if (is_piece_checked(piece))
-    {
-        return true;
-    }
-
-    auto hash = tr_sha1_digest_t{};
-    auto const result = tr_ioHashSpan(make_io_plan(block_info().byte_span_for_piece(piece)), session->openFiles(), hash);
-    auto const passed = !result.error && hash == piece_hash(piece);
-    tr_logAddTraceTor(this, fmt::format("[LAZY] tested piece {}, pass=={}", piece, passed));
-    set_piece_is_checked(piece, passed);
-    return passed;
-}
-
 void tr_torrent::request_piece_check(tr_piece_index_t const piece)
 {
     TR_ASSERT(session->am_in_session_thread());
@@ -1034,28 +971,13 @@ void tr_torrent::on_metainfo_completed()
 
     callScriptIfEnabled(this, TR_SCRIPT_ON_TORRENT_ADDED);
 
-    if (session->shouldFullyVerifyAddedTorrents() || !is_new_torrent_a_seed())
-    {
-        // Potentially, we are in `tr_torrent::init`,
-        // and we don't want any file created before `tr_torrent::start`
-        // so we Verify but we don't Create files.
-        tr_torrentVerify(this);
-    }
-    else
-    {
-        completion_.set_has_all();
-        recheck_completeness();
-        date_done_ = date_added_; // Must be after recheck_completeness()
-
-        if (start_when_stable_)
-        {
-            start(false, {});
-        }
-        else if (is_running())
-        {
-            stop_soon();
-        }
-    }
+    // Potentially, we are in `tr_torrent::init`, and we don't want any file
+    // created before `tr_torrent::start`, so we Verify but we don't Create
+    // files. The verify worker also sniffs out a newly-added seed (files
+    // that look complete and a first piece that hashes) so that it can skip
+    // the full walk; those stats and that hash used to run here, on the
+    // adding thread.
+    start_verify(!session->shouldFullyVerifyAddedTorrents());
 }
 
 void tr_torrent::init(tr_ctor const& ctor)
@@ -1858,8 +1780,13 @@ void tr_torrentVerify(tr_torrent* tor)
 {
     tr_return_if_fail(tr_isTorrent(tor));
 
-    tor->session->run_in_session_thread(
-        [tor, session = tor->session, tor_id = tor->id()]()
+    tor->start_verify(false);
+}
+
+void tr_torrent::start_verify(bool const sniff_new_seed)
+{
+    session->run_in_session_thread(
+        [tor = this, session = this->session, tor_id = id(), sniff_new_seed]()
         {
             TR_ASSERT(session->am_in_session_thread());
             auto const lock = session->unique_lock();
@@ -1886,15 +1813,10 @@ void tr_torrentVerify(tr_torrent* tor)
                 tor->stop_now();
             }
 
-            if (did_files_disappear(tor))
-            {
-                tor->error().set_local_error(
-                    _("Paused torrent as no data was found! Ensure your drives are connected or use \"Set Location\", "
-                      "then use \"Verify Local Data\" again. To re-download, start the torrent."));
-                tor->start_when_stable_ = false;
-            }
-
-            session->verify_add(tor);
+            // Whether the files have disappeared is learned from the verify
+            // itself (see VerifyMediator::on_verify_done), not by statting
+            // them all here.
+            session->verify_add(tor, sniff_new_seed);
         });
 }
 
@@ -1917,12 +1839,15 @@ void tr_torrent::on_verify_removed()
     }
 }
 
-tr_torrent::VerifyMediator::VerifyMediator(tr_torrent const* const tor)
+tr_torrent::VerifyMediator::VerifyMediator(tr_torrent const* const tor, bool const sniff_new_seed)
     : session_{ tor->session }
     , poster_{ tor->session->session_thread_poster() }
     , tor_id_{ tor->id() }
     , generation_{ tor->verify_generation_ }
     , metainfo_{ tor->metainfo_ }
+    , sniff_new_seed_{ sniff_new_seed }
+    , date_added_{ tor->date_added_ }
+    , had_data_{ tor->has_total() > 0U }
 {
     using namespace location_helpers;
 
@@ -1940,6 +1865,47 @@ std::optional<std::string> tr_torrent::VerifyMediator::find_file(tr_file_index_t
     }
 
     return {};
+}
+
+// (called from tr_verify_worker's thread)
+bool tr_torrent::VerifyMediator::is_complete_copy_on_disk() const
+{
+    auto paths = std::vector<std::string_view>{ std::begin(search_paths_), std::end(search_paths_) };
+    auto const& files = metainfo_.files();
+
+    for (tr_file_index_t i = 0, n = files.file_count(); i < n; ++i)
+    {
+        // it's not a new seed if a file is missing
+        auto const found = files.find(i, std::data(paths), std::size(paths));
+        if (!found)
+        {
+            return false;
+        }
+
+        // it's not a new seed if a file is partial
+        if (tr_strv_ends_with(found->filename(), tr_torrent_files::PartialFileSuffix))
+        {
+            return false;
+        }
+
+        // it's not a new seed if a file size is wrong
+        if (found->size != files.file_size(i))
+        {
+            return false;
+        }
+
+        // it's not a new seed if it was modified after it was added
+        if (found->last_modified_at >= date_added_)
+        {
+            return false;
+        }
+    }
+
+    // Same-named files of the right size may still hold other content
+    // (e.g. a different release of the same title), and a torrent that
+    // skips the verify step announces `left=0` on the strength of this
+    // check alone, so the worker hashes the first piece before believing it.
+    return true;
 }
 
 void tr_torrent::VerifyMediator::post(std::function<void(tr_torrent&)> func) const
@@ -2084,7 +2050,35 @@ void tr_torrent::VerifyMediator::flush_checked_pieces()
 }
 
 // (called from tr_verify_worker's thread)
-void tr_torrent::VerifyMediator::on_verify_done(bool const aborted)
+void tr_torrent::VerifyMediator::on_new_seed_found()
+{
+    TR_ASSERT(std::empty(checked_));
+
+    post(
+        [](tr_torrent& tor)
+        {
+            tr_logAddDebugTor(&tor, "Files look complete and the first piece hashes: a new seed, skipping the verify");
+
+            tor.set_piece_is_checked(0U, true);
+            tor.completion_.set_has_all();
+            tor.set_verify_state(VerifyState::None);
+            tor.recheck_completeness();
+            tor.date_done_ = tor.date_added_; // Must be after recheck_completeness()
+
+            if (tor.verify_done_callback_)
+            {
+                tor.verify_done_callback_(&tor);
+            }
+
+            if (tor.start_when_stable_)
+            {
+                tor.start(false, true /*has_any_local_data*/);
+            }
+        });
+}
+
+// (called from tr_verify_worker's thread)
+void tr_torrent::VerifyMediator::on_verify_done(bool const aborted, bool const found_any_file)
 {
     if (aborted)
     {
@@ -2097,7 +2091,7 @@ void tr_torrent::VerifyMediator::on_verify_done(bool const aborted)
     flush_checked_pieces();
 
     post(
-        [time_started = time_started_](tr_torrent& tor)
+        [time_started = time_started_, had_data = had_data_, found_any_file](tr_torrent& tor)
         {
             if (time_started.has_value())
             {
@@ -2113,6 +2107,16 @@ void tr_torrent::VerifyMediator::on_verify_done(bool const aborted)
             }
 
             tor.set_verify_state(VerifyState::None);
+
+            // A torrent that had data and now has none of its files on disk
+            // stays paused rather than re-downloading over a missing drive.
+            if (had_data && !found_any_file)
+            {
+                tor.error().set_local_error(
+                    _("Paused torrent as no data was found! Ensure your drives are connected or use \"Set Location\", "
+                      "then use \"Verify Local Data\" again. To re-download, start the torrent."));
+                tor.start_when_stable_ = false;
+            }
 
             for (tr_file_index_t file = 0, n_files = tor.file_count(); file < n_files; ++file)
             {
@@ -2806,16 +2810,7 @@ void tr_torrent::set_download_dir(std::string_view path, bool is_new_torrent)
 
     if (is_new_torrent)
     {
-        if (session->shouldFullyVerifyAddedTorrents() || !is_new_torrent_a_seed())
-        {
-            tr_torrentVerify(this);
-        }
-        else
-        {
-            completion_.set_has_all();
-            recheck_completeness();
-            date_done_ = date_added_; // Must be after recheck_completeness()
-        }
+        start_verify(!session->shouldFullyVerifyAddedTorrents());
     }
     else if (error_.is_local_error() && !set_local_error_if_files_disappeared(this))
     {

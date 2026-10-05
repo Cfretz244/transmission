@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib> // getenv()
@@ -26,6 +27,7 @@
 #include <libtransmission/crypto-utils.h> // tr_base64_decode()
 #include <libtransmission/error.h>
 #include <libtransmission/file.h> // tr_sys_file_*()
+#include <libtransmission/local-data.h>
 #include <libtransmission/quark.h>
 #include <libtransmission/torrent-ctor.h>
 #include <libtransmission/torrent.h>
@@ -373,7 +375,31 @@ protected:
 
         EXPECT_NE(nullptr, tor);
         verified_cv_.wait_for(verified_lock, 20s, stop_waiting);
+        drainLocalData(tor);
         return tor;
+    }
+
+    // A finished verify queues a path update per file on the torrent's
+    // LocalData queue (adding or dropping the ".part" suffix), which runs
+    // after the verify-done callback. Queue a read behind them and wait for
+    // it, so a test that looks at the files next sees them settled.
+    void drainLocalData(tr_torrent* tor)
+    {
+        if (tor == nullptr || !tor->has_metainfo() || tor->block_count() == 0U)
+        {
+            return;
+        }
+
+        auto done = std::atomic<bool>{ false };
+        session_->run_in_session_thread(
+            [this, tor, &done]()
+            {
+                session_->local_data.read(
+                    tor->make_io_plan(tor->block_info().byte_span_for_block(0U)),
+                    [&done](tr_torrent_id_t, tr_byte_span_t, tr_error const&, std::unique_ptr<tr::LocalData::BlockData>)
+                    { done = true; });
+            });
+        EXPECT_TRUE(waitFor([&done]() { return done.load(); }, 20s));
     }
 
     // 1048576 files-filled-with-zeroes/1048576
@@ -497,6 +523,8 @@ protected:
         };
         tr_torrentVerify(tor);
         verified_cv_.wait_for(verified_lock, 20s, stop_waiting);
+        verified_lock.unlock();
+        drainLocalData(tor);
     }
 
     tr_session* session_ = nullptr;

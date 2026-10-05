@@ -37,6 +37,12 @@ void tr_verify_worker::verify_torrent(
 {
     verify_mediator.on_verify_started();
 
+    // If the files look like a complete copy, hash the first piece only:
+    // a match makes this a new seed, a mismatch falls through to the walk.
+    auto sniffing = verify_mediator.sniff_new_seed() && verify_mediator.is_complete_copy_on_disk();
+    auto new_seed = false;
+    auto found_any_file = false;
+
     tr_sys_file_t fd = TR_BAD_SYS_FILE;
     uint64_t file_pos = 0U;
     uint32_t piece_pos = 0U;
@@ -56,6 +62,7 @@ void tr_verify_worker::verify_torrent(
         if (file_pos == 0U && fd == TR_BAD_SYS_FILE && file_index != prev_file_index)
         {
             auto const found = verify_mediator.find_file(file_index);
+            found_any_file |= found.has_value();
             fd = !found ? TR_BAD_SYS_FILE : tr_sys_file_open(*found, TR_SYS_FILE_READ | TR_SYS_FILE_SEQUENTIAL, 0);
             prev_file_index = file_index;
         }
@@ -87,6 +94,18 @@ void tr_verify_worker::verify_torrent(
         if (left_in_piece == 0U)
         {
             auto const has_piece = sha.finish() == metainfo.piece_hash(piece);
+
+            if (sniffing)
+            {
+                if (has_piece)
+                {
+                    new_seed = true;
+                    break;
+                }
+
+                sniffing = false; // not the copy the metadata says it is: verify it all
+            }
+
             verify_mediator.on_piece_checked(piece, has_piece);
 
             if (sleep_per_seconds_during_verify > std::chrono::milliseconds::zero())
@@ -125,7 +144,14 @@ void tr_verify_worker::verify_torrent(
         tr_sys_file_close(fd);
     }
 
-    verify_mediator.on_verify_done(abort_flag);
+    if (new_seed)
+    {
+        verify_mediator.on_new_seed_found();
+    }
+    else
+    {
+        verify_mediator.on_verify_done(abort_flag, found_any_file);
+    }
 }
 
 void tr_verify_worker::verify_thread_func()
@@ -181,7 +207,7 @@ void tr_verify_worker::remove(tr_sha1_digest_t const& info_hash)
     else if (auto const iter = std::ranges::find_if(todo_, [&info_hash](auto const& node) { return node.matches(info_hash); });
              iter != std::ranges::end(todo_))
     {
-        iter->mediator_->on_verify_done(true /*aborted*/);
+        iter->mediator_->on_verify_done(true /*aborted*/, false);
         todo_.erase(iter);
     }
 }

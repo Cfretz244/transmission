@@ -158,11 +158,13 @@ struct tr_torrent
     // by torrent id, tagged with the verify generation they belong to, and
     // are dropped if the torrent is gone or was pulled off the verifier
     // since. So stopping a verify only flags the worker thread; nobody waits
-    // on a read that may be stuck on a slow disk.
+    // on a read that may be stuck on a slow disk. With `sniff_new_seed`, the
+    // stats and first-piece hash that decide whether a newly-added torrent
+    // is already a seed run there too.
     class VerifyMediator : public tr_verify_worker::Mediator
     {
     public:
-        explicit VerifyMediator(tr_torrent const* tor);
+        VerifyMediator(tr_torrent const* tor, bool sniff_new_seed);
 
         ~VerifyMediator() override = default;
 
@@ -173,10 +175,18 @@ struct tr_torrent
 
         [[nodiscard]] std::optional<std::string> find_file(tr_file_index_t file_index) const override;
 
+        [[nodiscard]] bool sniff_new_seed() const override
+        {
+            return sniff_new_seed_;
+        }
+
+        [[nodiscard]] bool is_complete_copy_on_disk() const override;
+
         void on_verify_queued() override;
         void on_verify_started() override;
         void on_piece_checked(tr_piece_index_t piece, bool has_piece) override;
-        void on_verify_done(bool aborted) override;
+        void on_new_seed_found() override;
+        void on_verify_done(bool aborted, bool found_any_file) override;
 
     private:
         // Runs `func` on the session thread against this verify's torrent,
@@ -192,6 +202,9 @@ struct tr_torrent
         uint32_t const generation_;
         tr_torrent_metainfo const metainfo_;
         std::vector<std::string> search_paths_;
+        bool const sniff_new_seed_;
+        time_t const date_added_;
+        bool const had_data_; // has_total() > 0 when queued
 
         std::optional<time_t> time_started_;
 
@@ -724,11 +737,6 @@ struct tr_torrent
     }
 
     void set_piece_is_checked(tr_piece_index_t piece, bool passed);
-
-    // Hashes `piece` on the calling (session) thread and records the result.
-    // Only for the add-time seed check, where nothing is queued yet; every
-    // other check goes through LocalData::test_piece().
-    bool check_piece_now(tr_piece_index_t piece);
 
     // Hashes a held-but-unchecked `piece` off the session thread, records
     // the result with set_piece_is_checked(), and then emits piece_checked_.
@@ -1481,7 +1489,12 @@ private:
 
     void stop_now();
 
-    [[nodiscard]] bool is_new_torrent_a_seed();
+    // Queues a verify on the session thread: pulls any verify in progress,
+    // stops the torrent, and hands it to the verify worker. With
+    // `sniff_new_seed`, the worker first checks whether the files on disk
+    // are a complete copy that hashes (a newly-added seed) and skips the
+    // full walk if so.
+    void start_verify(bool sniff_new_seed);
 
     //tr_stat stats_ = {};
 

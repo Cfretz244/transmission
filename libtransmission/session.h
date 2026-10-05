@@ -1044,7 +1044,7 @@ public:
         return settings().ratio_limit;
     }
 
-    void verify_add(tr_torrent* tor);
+    void verify_add(tr_torrent* tor, bool sniff_new_seed = false);
     void verify_remove(tr_torrent* tor);
 
     void fetch(tr_web::FetchOptions&& options) const

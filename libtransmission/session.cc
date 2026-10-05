@@ -2150,11 +2150,11 @@ void tr_session::verify_remove(tr_torrent* const tor)
     tor->on_verify_removed();
 }
 
-void tr_session::verify_add(tr_torrent* const tor)
+void tr_session::verify_add(tr_torrent* const tor, bool const sniff_new_seed)
 {
     if (verifier_)
     {
-        verifier_->add(std::make_unique<tr_torrent::VerifyMediator>(tor), tor->get_priority());
+        verifier_->add(std::make_unique<tr_torrent::VerifyMediator>(tor, sniff_new_seed), tor->get_priority());
     }
 }
 

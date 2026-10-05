@@ -697,7 +697,7 @@ protected:
             EXPECT_EQ(0, utime(filename.c_str(), &times));
         }
 
-        auto* const tor = tr_torrentNew(ctor, nullptr);
+        auto* const tor = createTorrentAndWaitForVerifyDone(ctor);
         tr_ctorFree(ctor);
         EXPECT_NE(nullptr, tor);
         EXPECT_TRUE(tor->has_all());
