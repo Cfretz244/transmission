@@ -189,6 +189,9 @@ public:
     [[nodiscard]] uint64_t enqueued_write_bytes() const;
     [[nodiscard]] uint64_t enqueued_write_bytes(tr_torrent_id_t id) const;
 
+    // True while a worker is running one of this torrent's tasks.
+    [[nodiscard]] bool is_active(tr_torrent_id_t id) const;
+
 private:
     class Impl;
     std::unique_ptr<Impl> impl_;

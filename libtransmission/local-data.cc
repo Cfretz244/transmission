@@ -628,6 +628,12 @@ public:
         return it != std::end(enqueued_write_bytes_by_id_) ? it->second : 0U;
     }
 
+    [[nodiscard]] bool is_active(tr_torrent_id_t const id) const
+    {
+        auto const lock = std::lock_guard(mutex_);
+        return active_ids_.contains(id);
+    }
+
 private:
     void release_write_bytes_unlocked(tr_torrent_id_t const id, uint64_t const n_bytes)
     {
@@ -970,6 +976,11 @@ uint64_t LocalData::enqueued_write_bytes() const
 uint64_t LocalData::enqueued_write_bytes(tr_torrent_id_t const id) const
 {
     return impl_->enqueued_write_bytes(id);
+}
+
+bool LocalData::is_active(tr_torrent_id_t const id) const
+{
+    return impl_->is_active(id);
 }
 
 } // namespace tr

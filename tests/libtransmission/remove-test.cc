@@ -405,6 +405,10 @@ protected:
             [state](tr_torrent_id_t, tr_byte_span_t, tr_error const&, std::unique_ptr<tr::LocalData::BlockData>)
             { state->stall_answered = true; });
 
+        // Wait for a worker to pick the read up: tr_torrentRemove() forgets
+        // the torrent's still-queued reads, and a cancelled stall is no stall.
+        ASSERT_TRUE(waitFor([this, id = tor->id()]() { return session_->local_data.is_active(id); }, MaxWaitMsec));
+
         // remove the torrent and its files: the delete queues behind the stall
         tr_torrentRemove(tor, true);
         ASSERT_TRUE(waitFor([this, &info_hash]() { return session_->torrents().get(info_hash) == nullptr; }, MaxWaitMsec));
