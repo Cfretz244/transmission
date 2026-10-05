@@ -17,6 +17,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -2752,38 +2753,74 @@ using SessionAccessors = std::pair<SessionGetter, SessionSetter>;
     return error_none;
 }
 
-[[nodiscard]] std::pair<JsonRpc::Error::Code, std::string> freeSpace(
-    tr_session* /*session*/,
-    tr_variant::Map const& args_in,
-    tr_variant::Map& args_out)
+void freeSpace(tr_session* session, tr_variant::Map const& args_in, struct tr_rpc_idle_data* idle_data)
 {
     using namespace JsonRpc;
 
     auto const path = args_in.value_if<std::string_view>(TR_KEY_path);
     if (!path)
     {
-        return { Error::INVALID_PARAMS, "directory path argument is missing"s };
+        tr_rpc_idle_done(idle_data, Error::INVALID_PARAMS, "directory path argument is missing"sv);
+        return;
     }
 
     if (tr_sys_path_is_relative(*path))
     {
-        return { Error::PATH_NOT_ABSOLUTE, "directory path is not absolute"s };
+        tr_rpc_idle_done(idle_data, Error::PATH_NOT_ABSOLUTE, "directory path is not absolute"sv);
+        return;
     }
 
-    // get the free space
-    auto error = tr_error{};
-    auto const capacity = tr_sys_path_get_capacity(*path, &error);
+    idle_data->args_out.try_emplace(TR_KEY_path, *path);
 
-    // response
-    args_out.try_emplace(TR_KEY_path, *path);
-    args_out.try_emplace(TR_KEY_size_bytes, capacity ? capacity->available : tr_variant{ -1 });
-    args_out.try_emplace(TR_KEY_total_size, capacity ? capacity->capacity : tr_variant{ -1 });
-
-    if (error)
+    // The statvfs takes as long as the mount takes to answer, so it runs on a
+    // detached thread that owns only its own copies and posts the answer back
+    // to the session thread; a wedged mount stalls this one request, not RPC
+    // or session close. If the session is closing by the time the answer is
+    // back, the RPC server is already gone, so the reply is dropped.
+    struct Pending
     {
-        return { Error::SYSTEM_ERROR, std::string{ error.message() } };
-    }
-    return { Error::SUCCESS, std::string{} };
+        explicit Pending(tr_rpc_idle_data* data)
+            : idle_data{ data }
+        {
+        }
+        Pending(Pending const&) = delete;
+        Pending& operator=(Pending const&) = delete;
+        ~Pending()
+        {
+            delete idle_data; // only non-null if the reply was never delivered
+        }
+        tr_rpc_idle_data* idle_data;
+    };
+
+    std::thread(
+        [poster = session->session_thread_poster(),
+         path = std::string{ *path },
+         pending = std::make_shared<Pending>(idle_data)]()
+        {
+            auto error = tr_error{};
+            auto const capacity = tr_sys_path_get_capacity(path, &error);
+            poster->post(
+                [pending, capacity, error = std::move(error)]()
+                {
+                    auto* const data = std::exchange(pending->idle_data, nullptr);
+                    if (data->session->isClosing())
+                    {
+                        delete data;
+                        return;
+                    }
+                    data->args_out.try_emplace(TR_KEY_size_bytes, capacity ? capacity->available : tr_variant{ -1 });
+                    data->args_out.try_emplace(TR_KEY_total_size, capacity ? capacity->capacity : tr_variant{ -1 });
+                    if (error)
+                    {
+                        tr_rpc_idle_done(data, Error::SYSTEM_ERROR, error.message());
+                    }
+                    else
+                    {
+                        tr_rpc_idle_done(data, Error::SUCCESS, {});
+                    }
+                });
+        })
+        .detach();
 }
 
 // ---
@@ -2802,7 +2839,6 @@ using SessionAccessors = std::pair<SessionGetter, SessionSetter>;
 using SyncHandler = std::pair<JsonRpc::Error::Code, std::string> (*)(tr_session*, tr_variant::Map const&, tr_variant::Map&);
 
 auto const sync_handlers = small::max_size_map<tr_quark, std::pair<SyncHandler, bool /*has_side_effects*/>, 20U>{ {
-    { TR_KEY_free_space, { freeSpace, false } },
     { TR_KEY_group_get, { groupGet, false } },
     { TR_KEY_group_set, { groupSet, true } },
     { TR_KEY_queue_move_bottom, { queueMoveBottom, true } },
@@ -2826,8 +2862,9 @@ auto const sync_handlers = small::max_size_map<tr_quark, std::pair<SyncHandler, 
 
 using AsyncHandler = void (*)(tr_session*, tr_variant::Map const&, tr_rpc_idle_data*);
 
-auto const async_handlers = small::max_size_map<tr_quark, std::pair<AsyncHandler, bool /*has_side_effects*/>, 4U>{ {
+auto const async_handlers = small::max_size_map<tr_quark, std::pair<AsyncHandler, bool /*has_side_effects*/>, 5U>{ {
     { TR_KEY_blocklist_update, { blocklistUpdate, true } },
+    { TR_KEY_free_space, { freeSpace, false } },
     { TR_KEY_port_test, { portTest, false } },
     { TR_KEY_torrent_add, { torrentAdd, true } },
     { TR_KEY_torrent_rename_path, { torrentRenamePath, true } },

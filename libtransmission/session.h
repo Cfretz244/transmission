@@ -18,6 +18,7 @@
 #include <cstdint> // uintX_t
 #include <ctime> // time_t
 #include <future>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -433,6 +434,27 @@ public:
     [[nodiscard]] auto* event_base() noexcept
     {
         return session_thread_->event_base();
+    }
+
+    // A handle a detached worker thread can use to hand a result back to the
+    // session thread. The worker may outlive the session (a statvfs stuck on
+    // a wedged mount, see rpcimpl.cc freeSpace), so it must not hold a
+    // tr_session*: closeImplPart1 invalidates the handle and anything posted
+    // after that is dropped instead of touching a session that is going away.
+    class SessionThreadPoster
+    {
+    public:
+        void post(std::function<void()> func);
+
+    private:
+        friend class tr_session;
+        std::mutex mutex_;
+        tr_session* session_ = nullptr;
+    };
+
+    [[nodiscard]] std::shared_ptr<SessionThreadPoster> session_thread_poster() const noexcept
+    {
+        return session_thread_poster_;
     }
 
     [[nodiscard]] constexpr auto& openFiles() noexcept
@@ -1394,6 +1416,8 @@ private:
         bool refresh_in_flight = false;
     };
     std::shared_ptr<FreeSpaceCache> free_space_cache_ = std::make_shared<FreeSpaceCache>();
+
+    std::shared_ptr<SessionThreadPoster> session_thread_poster_ = std::make_shared<SessionThreadPoster>();
 
 public:
     std::unique_ptr<tr::Timer> utp_timer;

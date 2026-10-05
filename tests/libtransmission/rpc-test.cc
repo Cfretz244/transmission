@@ -866,66 +866,64 @@ TEST_F(RpcTest, relativeFreeSpaceErrorLegacy)
     EXPECT_EQ(Expected, actual);
 }
 
-#ifdef _WIN32
-// JSON expects backslashes escaped, hence the double escaping here.
-#define RPC_NON_EXISTENT_PATH "C:\\\\this\\\\path\\\\does\\\\not\\\\exist"
-#else
-#define RPC_NON_EXISTENT_PATH "/this/path/does/not/exist"
-#endif
-
-constexpr std::string_view WellFormedRequest = R"json({
-    "id": 41414,
-    "jsonrpc": "2.0",
-    "method": "free_space",
-    "params": {
-        "path": ")json" RPC_NON_EXISTENT_PATH R"json("
-    }
-})json";
-
-constexpr std::string_view WellFormedResponse = R"json({
-    "id": 41414,
-    "jsonrpc": "2.0",
-    "result": {
-        "path": ")json" RPC_NON_EXISTENT_PATH R"json(",
-        "size_bytes": -1,
-        "total_size": -1
-    }
-})json";
-
-TEST_F(RpcTest, DISABLED_wellFormedFreeSpace)
+// The well-formed case is answered asynchronously: the statvfs runs on a
+// detached thread and the reply is posted back to the session thread.
+[[nodiscard]] tr_variant freeSpaceOf(tr_session* session, std::string_view path)
 {
-    auto constexpr Input = WellFormedRequest;
-    auto constexpr Expected = WellFormedResponse;
-    auto const actual = makeRequest(session_, Input);
-    EXPECT_EQ(Expected, actual);
+    auto params = tr_variant::Map{ 1U };
+    params.try_emplace(TR_KEY_path, path);
+    auto request_map = tr_variant::Map{ 4U };
+    request_map.try_emplace(TR_KEY_jsonrpc, "2.0"sv);
+    request_map.try_emplace(TR_KEY_id, 41414);
+    request_map.try_emplace(TR_KEY_method, "free_space"sv);
+    request_map.try_emplace(TR_KEY_params, std::move(params));
+    auto request = tr_variant{ std::move(request_map) };
+
+    auto promise = std::promise<tr_variant>{};
+    auto future = promise.get_future();
+    tr_rpc_request_exec(session, request, [&promise](tr_variant&& resp) { promise.set_value(std::move(resp)); });
+    return future.get();
 }
 
-constexpr std::string_view WellFormedLegacyRequest = R"json({
-    "arguments": {
-        "path": ")json" RPC_NON_EXISTENT_PATH R"json("
-    },
-    "method": "free-space",
-    "tag": 41414
-})json";
-
-constexpr std::string_view WellFormedLegacyResponse = R"json({
-    "arguments": {
-        "path": ")json" RPC_NON_EXISTENT_PATH R"json(",
-        "size-bytes": -1,
-        "total_size": -1
-    },
-    "result": "success",
-    "tag": 41414
-})json";
-
-#undef RPC_NON_EXISTENT_PATH
-
-TEST_F(RpcTest, DISABLED_wellFormedLegacyFreeSpace)
+TEST_F(RpcTest, wellFormedFreeSpace)
 {
-    auto constexpr Input = WellFormedLegacyRequest;
-    auto constexpr Expected = WellFormedLegacyResponse;
-    auto const actual = makeRequest(session_, Input);
-    EXPECT_EQ(Expected, actual);
+    auto const response = freeSpaceOf(session_, sandboxDir());
+
+    auto const* const response_map = response.get_if<tr_variant::Map>();
+    ASSERT_NE(response_map, nullptr);
+    EXPECT_EQ(41414, response_map->value_if<int64_t>(TR_KEY_id));
+    EXPECT_EQ(std::end(*response_map), response_map->find(TR_KEY_error));
+    auto const* const result = response_map->find_if<tr_variant::Map>(TR_KEY_result);
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(sandboxDir(), result->value_if<std::string_view>(TR_KEY_path));
+    EXPECT_LE(int64_t{ 0 }, result->value_if<int64_t>(TR_KEY_size_bytes).value_or(-1));
+    EXPECT_LT(int64_t{ 0 }, result->value_if<int64_t>(TR_KEY_total_size).value_or(-1));
+}
+
+TEST_F(RpcTest, freeSpaceOfMissingPathIsAnError)
+{
+#ifdef _WIN32
+    static auto constexpr Path = "C:\\this\\path\\does\\not\\exist"sv;
+#else
+    static auto constexpr Path = "/this/path/does/not/exist"sv;
+#endif
+
+    auto const response = freeSpaceOf(session_, Path);
+
+    auto const* const response_map = response.get_if<tr_variant::Map>();
+    ASSERT_NE(response_map, nullptr);
+    EXPECT_EQ(41414, response_map->value_if<int64_t>(TR_KEY_id));
+    EXPECT_EQ(std::end(*response_map), response_map->find(TR_KEY_result));
+    auto const* const error = response_map->find_if<tr_variant::Map>(TR_KEY_error);
+    ASSERT_NE(error, nullptr);
+    auto const* const data = error->find_if<tr_variant::Map>(TR_KEY_data);
+    ASSERT_NE(data, nullptr);
+    EXPECT_FALSE(std::empty(data->value_if<std::string_view>(TR_KEY_error_string).value_or(""sv)));
+    auto const* const result = data->find_if<tr_variant::Map>(TR_KEY_result);
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(Path, result->value_if<std::string_view>(TR_KEY_path));
+    EXPECT_EQ(int64_t{ -1 }, result->value_if<int64_t>(TR_KEY_size_bytes));
+    EXPECT_EQ(int64_t{ -1 }, result->value_if<int64_t>(TR_KEY_total_size));
 }
 } // namespace free_space_test
 

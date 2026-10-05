@@ -639,6 +639,15 @@ void tr_session::on_now_timer()
     now_timer_->set_interval(std::chrono::duration_cast<std::chrono::milliseconds>(target_interval));
 }
 
+void tr_session::SessionThreadPoster::post(std::function<void()> func)
+{
+    auto const lock = std::scoped_lock{ mutex_ };
+    if (session_ != nullptr)
+    {
+        session_->run_in_session_thread(std::move(func));
+    }
+}
+
 int64_t tr_session::download_dir_free_space_bytes() const
 {
     auto& cache = *free_space_cache_;
@@ -1454,6 +1463,11 @@ void tr_session::closeImplPart1(std::promise<void>* closed_promise, std::chrono:
 {
     is_closing_ = true;
 
+    {
+        auto const lock = std::scoped_lock{ session_thread_poster_->mutex_ };
+        session_thread_poster_->session_ = nullptr;
+    }
+
     // close the low-hanging fruit that can be closed immediately w/o consequences
     utp_timer.reset();
     verifier_.reset();
@@ -2247,6 +2261,8 @@ tr_session::tr_session(std::string_view config_dir, tr_variant const& settings_d
     , queue_timer_{ timer_maker_->create([this]() { on_queue_timer(); }) }
     , save_timer_{ timer_maker_->create([this]() { on_save_timer(); }) }
 {
+    session_thread_poster_->session_ = this;
+
     now_timer_->start_repeating(1s);
     queue_timer_->start_repeating(QueueInterval);
     save_timer_->start_repeating(SaveInterval);
