@@ -860,7 +860,14 @@ void tr_torrentFreeInSessionThread(tr_torrent* tor)
     {
         tr_torrent_metainfo::remove_file(tor->session->torrentDir(), tor->name(), tor->info_hash_string(), ".torrent"sv);
         tr_torrent_metainfo::remove_file(tor->session->torrentDir(), tor->name(), tor->info_hash_string(), ".magnet"sv);
-        tr_torrent_metainfo::remove_file(tor->session->resumeDir(), tor->name(), tor->info_hash_string(), ".resume"sv);
+
+        // Resume files are written on the state-writer thread; delete this
+        // one there too, so the delete runs after any save still queued.
+        for (auto& filename :
+             tr_torrent_metainfo::removable_files(tor->session->resumeDir(), tor->name(), tor->info_hash_string(), ".resume"sv))
+        {
+            tor->session->state_writer.remove(std::move(filename));
+        }
     }
 
     tor->session->local_data.forget(tor->id());

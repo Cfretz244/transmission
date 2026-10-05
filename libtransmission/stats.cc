@@ -71,7 +71,16 @@ void tr_stats::save_if_dirty()
         return;
     }
 
-    save();
+    if (saver_)
+    {
+        auto var = tr_variant{ serializer::save(cumulative(), Fields) };
+        api_compat::convert_outgoing_data(var);
+        saver_(std::string{ tr_pathbuf{ config_dir_, "/stats.json"sv } }, tr_variant_serde::json().to_string(var));
+    }
+    else
+    {
+        save();
+    }
 
     is_dirty_ = false;
 }

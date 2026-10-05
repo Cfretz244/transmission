@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint> // uint32_t, uint64_t
 #include <ctime>
 #include <string>
@@ -187,6 +188,14 @@ public:
         std::string_view suffix);
 
     static void remove_file(
+        std::string_view dirname,
+        std::string_view name,
+        std::string_view info_hash_string,
+        std::string_view suffix);
+
+    // The filenames remove_file() would delete: the current format and the
+    // legacy one, so that a caller can delete them on another thread.
+    [[nodiscard]] static std::array<std::string, 2> removable_files(
         std::string_view dirname,
         std::string_view name,
         std::string_view info_hash_string,

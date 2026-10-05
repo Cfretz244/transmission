@@ -7,11 +7,13 @@
 #include <cstddef>
 #include <ctime>
 #include <ranges>
+#include <string>
 #include <vector>
 
 #include <utime.h>
 
 #include <libtransmission/file.h>
+#include <libtransmission/session.h>
 #include <libtransmission/torrent.h>
 #include <libtransmission/torrent-ctor.h>
 #include <libtransmission/tr-strbuf.h>
@@ -19,6 +21,7 @@
 #include "test-fixtures.h"
 
 using TorrentTest = tr::test::SessionTest;
+using tr::test::waitFor;
 
 namespace
 {
@@ -185,4 +188,38 @@ TEST_F(TorrentTest, queueMoveBottom)
     {
         EXPECT_EQ(ExpectedQueuePosition[i], torrents[i]->queue_position()) << i;
     }
+}
+
+// Resume files are written on the session's state-writer thread, not the
+// session thread; flush() is how a reader waits for one.
+TEST_F(TorrentTest, resumeFileIsSavedOffTheSessionThread)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::NoFiles);
+    auto const resume_file = std::string{ tor->resume_file() };
+    EXPECT_FALSE(tr_sys_path_exists(resume_file));
+
+    // pausing marks the torrent dirty and saves it, as the save timer would
+    tr_torrentStop(tor);
+    EXPECT_TRUE(waitFor([&resume_file]() { return tr_sys_path_exists(resume_file); }, 3000));
+    session_->state_writer.flush(resume_file);
+    EXPECT_TRUE(tr_sys_path_exists(resume_file));
+}
+
+// Removing a torrent deletes its resume file behind any save still queued
+// for it, so the delete wins and a later re-add starts from nothing.
+TEST_F(TorrentTest, removedTorrentsResumeFileIsDeletedBehindQueuedSaves)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::NoFiles);
+    auto const resume_file = std::string{ tor->resume_file() };
+    auto const info_hash = tor->info_hash();
+
+    for (int i = 0; i < 20; ++i)
+    {
+        tr_torrentStop(tor); // each one queues a save
+    }
+    tr_torrentRemove(tor, false);
+    EXPECT_TRUE(waitFor([this, &info_hash]() { return session_->torrents().get(info_hash) == nullptr; }, 3000));
+
+    session_->state_writer.flush(resume_file);
+    EXPECT_FALSE(tr_sys_path_exists(resume_file));
 }

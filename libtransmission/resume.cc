@@ -9,6 +9,7 @@
 #include <cstring>
 #include <ctime>
 #include <limits>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -631,6 +632,11 @@ tr_resume::fields_t load_from_file(tr_torrent* tor, tr_torrent::ResumeHelper& he
     tr_torrent_metainfo::migrate_file(tor->session->resumeDir(), tor->name(), tor->info_hash_string(), ".resume"sv);
 
     auto const filename = tor->resume_file();
+
+    // A save or remove of this file may still be queued on the writer
+    // thread (e.g. this torrent was just removed and re-added).
+    tor->session->state_writer.flush(filename);
+
     auto benc = std::vector<char>{};
     if (!tr_sys_path_exists(filename) || !tr_file_read(filename, benc))
     {
@@ -995,11 +1001,28 @@ void save(tr_torrent* const tor, tr_torrent::ResumeHelper const& helper)
 
     auto out = tr_variant{ std::move(map) };
     tr::api_compat::convert_outgoing_data(out);
-    auto serde = tr_variant_serde::benc();
-    if (!serde.to_file(out, tor->resume_file()))
-    {
-        tor->error().set_local_error(fmt::format("Unable to save resume file: {:s}", serde.error_.message()));
-    }
+
+    // Serialize here, write on the state-writer thread: the session thread
+    // (and every RPC request behind it) does not wait on the config disk.
+    tor->session->state_writer.save(
+        tor->resume_file(),
+        tr_variant_serde::benc().to_string(out),
+        [session = tor->session, tor_id = tor->id()](tr_error const& error)
+        {
+            if (!error)
+            {
+                return;
+            }
+
+            session->run_in_session_thread(
+                [session, tor_id, message = std::string{ error.message() }]()
+                {
+                    if (auto* const tor = session->torrents().get(tor_id); tor != nullptr)
+                    {
+                        tor->error().set_local_error(fmt::format("Unable to save resume file: {:s}", message));
+                    }
+                });
+        });
 }
 
 } // namespace tr_resume

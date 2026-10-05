@@ -1539,6 +1539,10 @@ void tr_session::closeImplPart2(std::promise<void>* closed_promise, std::chrono:
     this->announcer_udp_.reset();
 
     stats().save();
+
+    // Every resume file queued while the torrents were closed must reach
+    // disk before we return; what cannot by `deadline` is logged and lost.
+    state_writer.shutdown(deadline);
     peer_mgr_.reset();
     tr_utp_close(this);
     this->udp_core_.reset();
@@ -2246,6 +2250,14 @@ tr_session::tr_session(std::string_view config_dir, tr_variant const& settings_d
     now_timer_->start_repeating(1s);
     queue_timer_->start_repeating(QueueInterval);
     save_timer_->start_repeating(SaveInterval);
+
+    session_stats_.set_saver([this](std::string filename, std::string contents)
+                             { state_writer.save(std::move(filename), std::move(contents)); });
+}
+
+void tr_session::QueueMediator::save_state_file(std::string filename, std::string contents) const
+{
+    session_.state_writer.save(std::move(filename), std::move(contents));
 }
 
 void tr_session::addIncoming(std::shared_ptr<tr_peer_socket> socket)

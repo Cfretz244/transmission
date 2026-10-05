@@ -46,6 +46,7 @@
 #include "libtransmission/interned-string.h"
 #include "libtransmission/ip-cache.h"
 #include "libtransmission/local-data.h"
+#include "libtransmission/state-writer.h"
 #include "libtransmission/net.h" // for tr_port, tr_tos_t
 #include "libtransmission/open-files.h"
 #include "libtransmission/platform.h"
@@ -247,6 +248,8 @@ private:
         }
 
         [[nodiscard]] std::string store_filename(tr_torrent_id_t id) const override;
+
+        void save_state_file(std::string filename, std::string contents) const override;
 
     private:
         tr_session& session_;
@@ -1323,6 +1326,10 @@ public:
     // it looks at its files, so the old files cannot make it complete and
     // announce `left=0` for data that is about to vanish.
     std::vector<std::string> deleting_paths_;
+
+    // Writes resume files, stats.json and the queue order on its own thread.
+    // Drained at session close (closeImplPart2) with the close deadline.
+    tr::StateWriter state_writer;
 
 private:
     // depends-on: settings_, session_thread_, timer_maker_, web_

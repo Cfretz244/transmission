@@ -759,9 +759,18 @@ void tr_torrent_metainfo::remove_file(
     std::string_view info_hash_string,
     std::string_view suffix)
 {
-    auto filename = make_filename(dirname, name, info_hash_string, BasenameFormat::NameAndPartialHash, suffix);
-    tr_sys_path_remove(filename, nullptr);
+    for (auto const& filename : removable_files(dirname, name, info_hash_string, suffix))
+    {
+        tr_sys_path_remove(filename, nullptr);
+    }
+}
 
-    filename = make_filename(dirname, name, info_hash_string, BasenameFormat::Hash, suffix);
-    tr_sys_path_remove(filename, nullptr);
+std::array<std::string, 2> tr_torrent_metainfo::removable_files(
+    std::string_view dirname,
+    std::string_view name,
+    std::string_view info_hash_string,
+    std::string_view suffix)
+{
+    return { make_filename(dirname, name, info_hash_string, BasenameFormat::NameAndPartialHash, suffix),
+             make_filename(dirname, name, info_hash_string, BasenameFormat::Hash, suffix) };
 }

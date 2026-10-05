@@ -25,6 +25,9 @@ public:
 
         [[nodiscard]] virtual std::string config_dir() const = 0;
         [[nodiscard]] virtual std::string store_filename(tr_torrent_id_t id) const = 0;
+
+        // Write a state file. The default writes it inline.
+        virtual void save_state_file(std::string filename, std::string contents) const;
     };
 
     explicit tr_torrent_queue(Mediator const& mediator)

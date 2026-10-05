@@ -30,6 +30,8 @@ target_sources(${TR_NAME}
         announcer.h
         local-data.cc
         local-data.h
+        state-writer.cc
+        state-writer.h
         api-compat.cc
         api-compat.h
         bandwidth.cc

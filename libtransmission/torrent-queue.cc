@@ -9,6 +9,7 @@
 #include <string_view>
 #include <vector>
 
+#include "libtransmission/file-utils.h" // tr_file_save()
 #include "libtransmission/torrent-queue.h"
 #include "libtransmission/tr-strbuf.h"
 #include "libtransmission/variant.h"
@@ -119,7 +120,15 @@ bool tr_torrent_queue::to_file()
         vec.emplace_back(mediator_.store_filename(id));
     }
 
-    return tr_variant_serde::json().to_file(std::move(vec), get_file_path(mediator_.config_dir()));
+    mediator_.save_state_file(
+        std::string{ get_file_path(mediator_.config_dir()) },
+        tr_variant_serde::json().to_string(tr_variant{ std::move(vec) }));
+    return true;
+}
+
+void tr_torrent_queue::Mediator::save_state_file(std::string filename, std::string contents) const
+{
+    tr_file_save(filename, contents);
 }
 
 std::vector<std::string> tr_torrent_queue::from_file()

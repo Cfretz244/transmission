@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <ctime>
+#include <functional>
 #include <string>
 #include <string_view>
 
@@ -40,6 +41,14 @@ public:
     tr_stats& operator=(tr_stats&&) = delete;
 
     void clear();
+
+    // Where save_if_dirty() sends stats.json. Unset, it writes inline;
+    // save() (used at close and by the destructor) always writes inline.
+    using Saver = std::function<void(std::string filename, std::string contents)>;
+    void set_saver(Saver saver)
+    {
+        saver_ = std::move(saver);
+    }
 
     [[nodiscard]] tr_session_stats current() const;
 
@@ -88,4 +97,5 @@ private:
     tr_session_stats single_ = Zero;
     tr_session_stats old_ = Zero;
     bool is_dirty_ = false;
+    Saver saver_;
 };
