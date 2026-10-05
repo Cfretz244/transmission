@@ -357,6 +357,19 @@ struct tr_torrent
         return completion_.has_block(block);
     }
 
+    // True while a write of `block` is queued or in progress. The block
+    // is not held yet, but it must not be requested or accepted again: a
+    // second copy could land after the piece was verified.
+    [[nodiscard]] bool is_block_write_pending(tr_block_index_t block) const
+    {
+        return blocks_being_written_.contains(block);
+    }
+
+    [[nodiscard]] bool has_block_or_write_pending(tr_block_index_t block) const
+    {
+        return has_block(block) || is_block_write_pending(block);
+    }
+
     [[nodiscard]] auto has_blocks(tr_block_span_t span) const
     {
         return completion_.has_blocks(span);
@@ -1000,6 +1013,18 @@ struct tr_torrent
         return peer_id_;
     }
 
+    // Called when a write of `block` is handed to LocalData, and again
+    // (by tr_peerMgrBlockWritten) when that write has landed or failed.
+    void on_block_write_queued(tr_block_index_t block)
+    {
+        blocks_being_written_.insert(block);
+    }
+
+    void on_block_write_done(tr_block_index_t block)
+    {
+        blocks_being_written_.erase(block);
+    }
+
     void on_block_received(tr_block_index_t block);
 
     // Applies the outcome of a LocalData write to the session and, if it
@@ -1509,6 +1534,10 @@ private:
 
     // Pieces with a request_piece_check() in flight. Session thread only.
     std::unordered_set<tr_piece_index_t> requested_piece_checks_;
+
+    // Blocks with a write in flight; see is_block_write_pending().
+    // Session thread only.
+    std::unordered_set<tr_block_index_t> blocks_being_written_;
 
     bool sequential_download_ = false;
 

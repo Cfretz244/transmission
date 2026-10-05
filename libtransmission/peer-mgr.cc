@@ -429,7 +429,8 @@ public:
 
         [[nodiscard]] bool client_has_block(tr_block_index_t const block) const override
         {
-            return tor_.has_block(block);
+            // a block being written must not be re-requested either
+            return tor_.has_block_or_write_pending(block);
         }
 
         [[nodiscard]] bool client_has_piece(tr_piece_index_t const piece) const override
@@ -1910,6 +1911,9 @@ void tr_peerMgrBlockWritten(
 {
     TR_ASSERT(tr_isTorrent(tor));
     TR_ASSERT(tor->session->am_in_session_thread());
+
+    // before the swarm re-queues a failed block on the wishlist
+    tor->on_block_write_done(block);
 
     if (auto* const s = tor->swarm; s != nullptr)
     {

@@ -1983,7 +1983,7 @@ ReadResult tr_peerMsgsImpl::read_piece_data(MessageReader& payload)
         return { ReadState::Err, len };
     }
 
-    if (tor_.has_block(block))
+    if (tor_.has_block_or_write_pending(block))
     {
         logtrace(this, fmt::format("got completed block {:d} ({:d}:{:d}->{:d})", block, piece, offset, len));
         return { ReadState::Err, len };
@@ -2046,6 +2046,7 @@ tr_error_code_t tr_peerMsgsImpl::client_got_block(
     logtrace(this, fmt::format("got block {:d}", block));
 
     active_requests.unset(block);
+    tor_.on_block_write_queued(block);
 
     // The write finishes later on the session thread. By then this peer may
     // have disconnected and the torrent may have been stopped or freed, so

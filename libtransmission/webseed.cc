@@ -390,7 +390,7 @@ void tr_webseed_task::use_fetched_blocks()
             break;
         }
 
-        if (tor.has_block(loc_.block))
+        if (tor.has_block_or_write_pending(loc_.block))
         {
             content_.drain(block_size);
         }
@@ -413,7 +413,7 @@ void tr_webseed_task::use_fetched_blocks()
                     }
 
                     webseed->active_requests.unset(block);
-                    auto const* const torrent = session->torrents().get(tor_id);
+                    auto* const torrent = session->torrents().get(tor_id);
                     if (torrent == nullptr)
                     {
                         return;
@@ -438,6 +438,7 @@ void tr_webseed_task::use_fetched_blocks()
                                 error);
                         }
                     };
+                    torrent->on_block_write_queued(block);
                     session->local_data.write(
                         torrent->make_io_plan(byte_span),
                         std::make_unique<tr::LocalData::BlockData>(std::move(*block_data)),

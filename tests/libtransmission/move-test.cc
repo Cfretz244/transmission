@@ -361,6 +361,7 @@ protected:
             plan.current_dir = data->bad_dir;
         }
 
+        data->tor->on_block_write_queued(data->block);
         data->session->local_data.write(
             std::move(plan),
             std::move(data->buf),
@@ -479,8 +480,50 @@ TEST_F(BlockWrittenTest, blockWhoseWriteFailedIsNotHeld)
 
     EXPECT_TRUE(data.error);
     EXPECT_FALSE(tor->has_block(block));
+    EXPECT_FALSE(tor->is_block_write_pending(block)); // free to be requested again
     EXPECT_EQ(had_total, tor->has_total());
     EXPECT_TRUE(tor->error().is_local_error());
+
+    tr_torrentRemove(tor, true);
+}
+
+// Between a block's arrival and its write landing, has_block() is still
+// false. Peers, webseeds and the wishlist used to treat that window as
+// "not held", so an endgame duplicate was accepted and written over the
+// first copy (possibly after the piece had been verified), and a wishlist
+// rebuild re-requested the block. The torrent now reports the block as
+// pending for that window.
+TEST_F(BlockWrittenTest, blockIsPendingUntilItsWriteLands)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Partial);
+    auto const block = tor->block_span_for_piece(0).begin;
+    ASSERT_FALSE(tor->has_block_or_write_pending(block));
+
+    auto data = WriteData{};
+    data.session = session_;
+    data.tor = tor;
+    data.block = block;
+    data.buf = std::make_unique<tr::LocalData::BlockData>(tr_block_info::BlockSize);
+    std::fill_n(std::data(*data.buf), tr_block_info::BlockSize, '\0');
+
+    // the completion runs on the session thread too, so it cannot have
+    // happened yet when these are read right after the submit
+    auto held_at_submit = true;
+    auto pending_at_submit = false;
+    session_->run_in_session_thread(
+        [&data, &held_at_submit, &pending_at_submit]()
+        {
+            write_from_departed_peer(&data);
+            held_at_submit = data.tor->has_block(data.block);
+            pending_at_submit = data.tor->is_block_write_pending(data.block);
+        });
+    EXPECT_TRUE(waitFor([&data]() { return data.done; }, MaxWaitMsec));
+
+    EXPECT_FALSE(held_at_submit);
+    EXPECT_TRUE(pending_at_submit);
+    EXPECT_FALSE(data.error) << data.error;
+    EXPECT_TRUE(tor->has_block(block));
+    EXPECT_FALSE(tor->is_block_write_pending(block));
 
     tr_torrentRemove(tor, true);
 }
