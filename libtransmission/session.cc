@@ -1424,7 +1424,10 @@ void tr_session::closeImplPart1(std::promise<void>* closed_promise, std::chrono:
     // post their completions to this thread's work queue, so run it now:
     // otherwise they would run only after the torrents below are freed and
     // their resume files saved, losing every block and check that landed.
-    this->local_data.shutdown();
+    // A disk too slow to drain by `deadline` costs the still-queued work
+    // instead: those blocks and checks are reported as failed, so the
+    // resume files never claim data that did not land.
+    this->local_data.shutdown(deadline);
     session_thread_->run_queued();
 
     // Close the torrents in order of most active to least active

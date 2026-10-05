@@ -9,6 +9,7 @@
 #error only libtransmission should #include this header.
 #endif
 
+#include <chrono>
 #include <cstddef> // size_t
 #include <cstdint> // uintX_t
 #include <functional>
@@ -180,7 +181,9 @@ public:
     // every queued write, piece check, move, rename and remove has run.
     // Their completions are dispatched as usual; a caller on the session
     // thread must run its work queue afterwards to see them.
-    void shutdown();
+    // Past `deadline`, whatever is still queued is cancelled instead
+    // (ECANCELED); the tasks already running are always allowed to finish.
+    void shutdown(std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max());
 
     // Bytes in queued writes that have not reached the backend yet.
     [[nodiscard]] uint64_t enqueued_write_bytes() const;

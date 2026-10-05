@@ -855,3 +855,56 @@ TEST(LocalData, ForgetWakesShutdownWaitingOnAQueuedWrite)
 
     EXPECT_EQ((std::vector<std::string>{ "1:read" }), raw_backend->log());
 }
+
+// A slow disk must not hold the session past its close timeout: once the
+// deadline passes, shutdown() cancels what is still queued and only waits
+// for the write that is already in the backend.
+TEST(LocalData, ShutdownDeadlineCancelsQueuedWrites)
+{
+    auto backend = std::make_unique<StubBackend>();
+    auto* raw_backend = backend.get();
+    backend->hold(1);
+    auto local_data = tr::LocalData{ std::move(backend), {}, 1U };
+
+    auto make_data = []()
+    {
+        auto data = std::make_unique<tr::LocalData::BlockData>();
+        data->assign({ uint8_t{ 1U } });
+        return data;
+    };
+
+    // the first write is blocked in the backend; the second waits behind it
+    auto first_result = std::promise<tr_error_code_t>{};
+    auto first_future = first_result.get_future();
+    local_data.write(
+        make_plan(1, { .begin = 0U, .end = 1U }),
+        make_data(),
+        [&](auto, auto, tr_error const& error, auto) { first_result.set_value(error.code()); });
+    ASSERT_TRUE(raw_backend->wait_until_running(1));
+    auto second_result = std::promise<tr_error_code_t>{};
+    auto second_future = second_result.get_future();
+    local_data.write(
+        make_plan(1, { .begin = 1U, .end = 2U }),
+        make_data(),
+        [&](auto, auto, tr_error const& error, auto) { second_result.set_value(error.code()); });
+
+    // the deadline passes with the first write still held, so the second is
+    // cancelled; the first is let go afterwards so the worker can be joined
+    auto releaser = std::thread(
+        [&]()
+        {
+            EXPECT_TRUE(wait_for(second_future));
+            raw_backend->release(1);
+        });
+    local_data.shutdown(std::chrono::steady_clock::now() + 100ms);
+    releaser.join();
+
+    EXPECT_EQ(ECANCELED, second_future.get());
+    ASSERT_TRUE(wait_for(first_future));
+    EXPECT_EQ(0, first_future.get());
+    EXPECT_EQ((std::vector<std::string>{ "1:write" }), raw_backend->log());
+    EXPECT_EQ(0U, local_data.enqueued_write_bytes());
+
+    local_data.close_all();
+    EXPECT_TRUE(raw_backend->close_all_called);
+}

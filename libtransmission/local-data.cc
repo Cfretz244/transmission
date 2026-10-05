@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -261,7 +262,7 @@ public:
 
     ~Impl()
     {
-        shutdown();
+        shutdown(std::chrono::steady_clock::time_point::max());
     }
 
     void read(tr_io_plan plan, OnRead on_read)
@@ -540,7 +541,7 @@ public:
         }
     }
 
-    void shutdown()
+    void shutdown(std::chrono::steady_clock::time_point const deadline)
     {
         auto canceled = std::vector<std::function<void()>>{};
 
@@ -574,7 +575,29 @@ public:
                 queue_it = std::empty(queue) ? queues_.erase(queue_it) : std::next(queue_it);
             }
 
-            drained_cv_.wait(lock, [this]() { return pending_non_read_ == 0U && active_non_read_ == 0U; });
+            auto const drained = [this]()
+            {
+                return pending_non_read_ == 0U && active_non_read_ == 0U;
+            };
+            if (deadline == std::chrono::steady_clock::time_point::max())
+            {
+                drained_cv_.wait(lock, drained);
+            }
+            else if (!drained_cv_.wait_until(lock, deadline, drained))
+            {
+                // Out of time. Nothing queued may start now; the tasks
+                // already in the backend finish when the workers are joined.
+                for (auto& [id, queue] : queues_)
+                {
+                    for (auto& task : queue)
+                    {
+                        discard_unlocked(task, canceled);
+                    }
+                }
+                queues_.clear();
+                runnable_ids_.clear();
+            }
+
             stopping_workers_ = true;
         }
 
@@ -934,9 +957,9 @@ void LocalData::forget(tr_torrent_id_t const id)
     impl_->forget(id);
 }
 
-void LocalData::shutdown()
+void LocalData::shutdown(std::chrono::steady_clock::time_point const deadline)
 {
-    impl_->shutdown();
+    impl_->shutdown(deadline);
 }
 
 uint64_t LocalData::enqueued_write_bytes() const
