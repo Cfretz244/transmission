@@ -15,7 +15,9 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
+#include <vector>
 
 #include <small/vector.hpp>
 
@@ -74,6 +76,8 @@ public:
 
     using OnRemove = std::function<void(tr_torrent_id_t, tr_error const& error)>;
 
+    using OnUpdateFilePath = std::function<void(tr_torrent_id_t, tr_file_index_t, tr_error const& error)>;
+
     // Runs a completion callback. See the class comment for the contract.
     using Dispatcher = std::function<void(std::function<void()>)>;
 
@@ -106,6 +110,14 @@ public:
             std::string_view base,
             std::string_view oldpath,
             std::string_view newname) = 0;
+        // Looks for `subpath` under each of `bases`, with or without the
+        // partial-file suffix, and renames it to the form `wants_partial_suffix`
+        // asks for. Nothing found, or already named that way, is not an error.
+        [[nodiscard]] virtual tr_error_code_t update_file_path(
+            tr_torrent_id_t id,
+            std::vector<std::string> const& bases,
+            std::string_view subpath,
+            bool wants_partial_suffix) = 0;
         virtual void close_all() = 0;
         virtual void close_torrent(tr_torrent_id_t tor_id) = 0;
         virtual void close_file(tr_torrent_id_t tor_id, tr_file_index_t file_num) = 0;
@@ -171,6 +183,17 @@ public:
         std::string_view oldpath,
         std::string_view newname,
         tr_torrent_rename_done_func callback);
+
+    // See tr_torrent::update_file_path(). Closes `file` first, then adds or
+    // drops the partial-file suffix on disk. Queued after the torrent's
+    // earlier tasks, so writes already queued under the old name land first.
+    void update_file_path(
+        tr_torrent_id_t id,
+        tr_file_index_t file,
+        std::vector<std::string> bases,
+        std::string subpath,
+        bool wants_partial_suffix,
+        OnUpdateFilePath callback);
 
     // Discards the torrent's queued reads, tests, writes, moves and renames;
     // their callbacks get ECANCELED. Queued closes and removes still run.

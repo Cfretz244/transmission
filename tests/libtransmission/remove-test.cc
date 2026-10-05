@@ -4,6 +4,7 @@
 // License text can be found in the licenses/ folder.
 
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstdint> // uint64_t
 #include <memory>
@@ -385,6 +386,16 @@ protected:
         blockingTorrentVerify(tor);
         ASSERT_TRUE(tor->has_all());
         auto const info_hash = tor->info_hash();
+
+        // Verification queued a path check per file on the torrent's disk
+        // queue. Let those drain behind a sentinel read, so that the
+        // is_active() wait below can only be satisfied by the stall.
+        auto const drained = std::make_shared<std::atomic<bool>>(false);
+        session_->local_data.read(
+            tor->make_io_plan(tor->block_info().byte_span_for_block(0U)),
+            [drained](tr_torrent_id_t, tr_byte_span_t, tr_error const&, std::unique_ptr<tr::LocalData::BlockData>)
+            { *drained = true; });
+        ASSERT_TRUE(waitFor([drained]() { return drained->load(); }, MaxWaitMsec));
         state->download_dir = tr_sessionGetDownloadDir(session_);
         state->first_file = tr_pathbuf{ state->download_dir, '/', tr_torrentFile(tor, 0).name };
         ASSERT_TRUE(tr_sys_path_exists(state->first_file));

@@ -173,6 +173,37 @@ public:
         return 0;
     }
 
+    [[nodiscard]] tr_error_code_t update_file_path(
+        tr_torrent_id_t /*id*/,
+        std::vector<std::string> const& bases,
+        std::string_view const subpath,
+        bool const wants_partial_suffix) override
+    {
+        auto const paths = std::vector<std::string_view>{ std::begin(bases), std::end(bases) };
+        auto const found = tr_torrent_files::find(subpath, std::data(paths), std::size(paths));
+        if (!found)
+        {
+            return 0;
+        }
+
+        auto const& oldpath = found->filename();
+        auto const newpath = wants_partial_suffix ?
+            tr_pathbuf{ found->base(), '/', subpath, tr_torrent_files::PartialFileSuffix } :
+            tr_pathbuf{ found->base(), '/', subpath };
+        if (tr_sys_path_is_same(oldpath, newpath))
+        {
+            return 0;
+        }
+
+        auto error = tr_error{};
+        if (!tr_sys_path_rename(oldpath, newpath, &error))
+        {
+            return error.code();
+        }
+
+        return 0;
+    }
+
     void close_all() override
     {
         open_files_.close_all();
@@ -221,7 +252,8 @@ private:
         CloseTorrent,
         Move,
         Remove,
-        Rename
+        Rename,
+        UpdateFilePath
     };
 
     struct Task
@@ -425,6 +457,37 @@ public:
             {
                 backend_->close_torrent(tor_id);
                 notify(backend_->rename(tor_id, base, oldpath_str, newname_str));
+            },
+            .cancel = [notify]() { notify(ECANCELED); },
+        });
+    }
+
+    void update_file_path(
+        tr_torrent_id_t const tor_id,
+        tr_file_index_t const file,
+        std::vector<std::string> bases,
+        std::string subpath,
+        bool const wants_partial_suffix,
+        OnUpdateFilePath callback)
+    {
+        auto callback_ptr = std::make_shared<OnUpdateFilePath>(std::move(callback));
+        auto const notify = [this, tor_id, file, callback_ptr](tr_error_code_t const err)
+        {
+            if (*callback_ptr == nullptr)
+            {
+                return;
+            }
+            dispatch([tor_id, file, callback_ptr, err]() { (*callback_ptr)(tor_id, file, make_error(err)); });
+        };
+
+        enqueue(Task{
+            .id = tor_id,
+            .op = Op::UpdateFilePath,
+            .run =
+                [this, tor_id, file, bases = std::move(bases), subpath = std::move(subpath), wants_partial_suffix, notify]()
+            {
+                backend_->close_file(tor_id, file);
+                notify(backend_->update_file_path(tor_id, bases, subpath, wants_partial_suffix));
             },
             .cancel = [notify]() { notify(ECANCELED); },
         });
@@ -956,6 +1019,17 @@ void LocalData::rename(
     tr_torrent_rename_done_func callback)
 {
     impl_->rename(id, base, oldpath, newname, std::move(callback));
+}
+
+void LocalData::update_file_path(
+    tr_torrent_id_t const id,
+    tr_file_index_t const file,
+    std::vector<std::string> bases,
+    std::string subpath,
+    bool const wants_partial_suffix,
+    OnUpdateFilePath callback)
+{
+    impl_->update_file_path(id, file, std::move(bases), std::move(subpath), wants_partial_suffix, std::move(callback));
 }
 
 void LocalData::forget(tr_torrent_id_t const id)

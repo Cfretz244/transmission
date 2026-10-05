@@ -124,6 +124,19 @@ public:
         return rename_err;
     }
 
+    [[nodiscard]] tr_error_code_t update_file_path(
+        tr_torrent_id_t tor_id,
+        std::vector<std::string> const& bases,
+        std::string_view subpath,
+        bool wants_partial_suffix) override
+    {
+        auto const guard = Running{ *this, tor_id, "update_file_path" };
+        updated_bases = bases;
+        updated_subpath = std::string{ subpath };
+        updated_wants_suffix = wants_partial_suffix;
+        return update_file_path_err;
+    }
+
     void close_all() override
     {
         close_all_called = true;
@@ -190,6 +203,7 @@ public:
     tr_error_code_t move_err = 0;
     tr_error_code_t remove_err = 0;
     tr_error_code_t rename_err = 0;
+    tr_error_code_t update_file_path_err = 0;
     std::atomic<bool> remove_called = false;
     std::atomic<bool> close_all_called = false;
     tr_byte_span_t read_span{};
@@ -206,6 +220,9 @@ public:
     std::string renamed_base;
     std::string renamed_from;
     std::string renamed_to;
+    std::vector<std::string> updated_bases;
+    std::string updated_subpath;
+    bool updated_wants_suffix = false;
     std::atomic<tr_torrent_id_t> closed_torrent = -1;
     std::optional<std::pair<tr_torrent_id_t, tr_file_index_t>> closed_file;
 
@@ -453,6 +470,26 @@ TEST(LocalData, AdminOperationsDelegate)
     EXPECT_EQ("old", raw_backend->renamed_from);
     EXPECT_EQ("new", raw_backend->renamed_to);
 
+    auto update_done = std::promise<void>{};
+    auto update_future = update_done.get_future();
+    local_data.update_file_path(
+        9,
+        3,
+        { "/download", "/incomplete" },
+        "dir/file",
+        true,
+        [&update_done](tr_torrent_id_t tor_id, tr_file_index_t file, tr_error const& error)
+        {
+            EXPECT_EQ(9, tor_id);
+            EXPECT_EQ(3U, file);
+            EXPECT_FALSE(error);
+            update_done.set_value();
+        });
+    ASSERT_TRUE(wait_for(update_future));
+    EXPECT_EQ((std::vector<std::string>{ "/download", "/incomplete" }), raw_backend->updated_bases);
+    EXPECT_EQ("dir/file", raw_backend->updated_subpath);
+    EXPECT_TRUE(raw_backend->updated_wants_suffix);
+
     auto remove_done = std::promise<void>{};
     auto remove_future = remove_done.get_future();
     local_data.remove(
@@ -483,8 +520,10 @@ TEST(LocalData, AdminOperationsDelegate)
 
     // a move or rename closes the torrent's files before touching them
     auto const log = raw_backend->log();
-    auto const expected = std::vector<std::string>{ "5:close_torrent", "5:move",  "8:close_torrent", "8:rename",
-                                                    "12:close_torrent", "12:remove", "13:close_file",    "14:close_torrent" };
+    auto const expected = std::vector<std::string>{ "5:close_torrent",  "5:move",       "8:close_torrent",
+                                                    "8:rename",         "9:close_file", "9:update_file_path",
+                                                    "12:close_torrent", "12:remove",    "13:close_file",
+                                                    "14:close_torrent" };
     EXPECT_EQ(expected, log);
 
     local_data.shutdown();

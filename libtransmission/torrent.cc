@@ -1926,35 +1926,43 @@ std::optional<std::string> tr_torrent::VerifyMediator::find_file(tr_file_index_t
 // so a file the move has not reached yet is not found and keeps its suffix.
 void tr_torrent::update_file_path(tr_file_index_t file, std::optional<bool> has_file) const
 {
-    auto const found = find_file(file);
-    if (!found)
-    {
-        return;
-    }
+    using namespace location_helpers;
+
+    auto paths = std::array<std::string_view, 4>{};
+    auto const n_paths = buildSearchPathArray(this, std::data(paths));
+    auto bases = std::vector<std::string>{ std::begin(paths), std::begin(paths) + n_paths };
 
     auto const has = has_file ? *has_file : this->has_file(file);
-    auto const needs_suffix = session->isIncompleteFileNamingEnabled() && !has;
-    auto const oldpath = found->filename();
-    auto const newpath = needs_suffix ?
-        tr_pathbuf{ found->base(), '/', file_subpath(file), tr_torrent_files::PartialFileSuffix } :
-        tr_pathbuf{ found->base(), '/', file_subpath(file) };
+    auto const wants_suffix = session->isIncompleteFileNamingEnabled() && !has;
 
-    if (tr_sys_path_is_same(oldpath, newpath))
-    {
-        return;
-    }
+    // The lookup and the rename run on the torrent's LocalData worker, after
+    // the I/O already queued for it, so a slow disk never holds the session
+    // thread here. The callback only reports a failure.
+    session->local_data.update_file_path(
+        id(),
+        file,
+        std::move(bases),
+        std::string{ file_subpath(file) },
+        wants_suffix,
+        [session = this->session](tr_torrent_id_t const tor_id, tr_file_index_t const file_num, tr_error const& error)
+        {
+            if (!error || error.code() == ECANCELED)
+            {
+                return;
+            }
 
-    if (auto error = tr_error{}; !tr_sys_path_rename(oldpath, newpath, &error))
-    {
-        tr_logAddErrorTor(
-            this,
-            fmt::format(
-                fmt::runtime(_("Couldn't move '{old_path}' to '{path}': {error} ({error_code})")),
-                fmt::arg("old_path", oldpath),
-                fmt::arg("path", newpath),
-                fmt::arg("error", error.message()),
-                fmt::arg("error_code", error.code())));
-    }
+            auto const lock = session->unique_lock();
+            if (auto const* const tor = session->torrents().get(tor_id); tor != nullptr)
+            {
+                tr_logAddErrorTor(
+                    tor,
+                    fmt::format(
+                        fmt::runtime(_("Couldn't rename '{path}': {error} ({error_code})")),
+                        fmt::arg("path", tor->file_subpath(file_num)),
+                        fmt::arg("error", error.message()),
+                        fmt::arg("error_code", error.code())));
+            }
+        });
 }
 
 void tr_torrent::VerifyMediator::on_verify_queued()
