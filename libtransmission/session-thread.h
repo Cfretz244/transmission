@@ -34,6 +34,10 @@ public:
 
     virtual void run(callback_t&& func) = 0;
 
+    // Runs every callback queued so far, including any they queue in
+    // turn. Must be called on the session thread.
+    virtual void run_queued() = 0;
+
     template<typename Func, typename... Args>
     void queue(Func&& func, Args&&... args)
     {

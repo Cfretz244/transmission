@@ -1419,10 +1419,13 @@ void tr_session::closeImplPart1(std::promise<void>* closed_promise, std::chrono:
 
     torrent_queue().to_file();
 
-    // Let every queued write, move and close reach disk while the torrents
-    // still exist: a worker task that finishes after its torrent is freed
-    // would fail its lookup and drop the block. Queued reads are cancelled.
+    // Let every queued write, piece check, move and close reach disk while
+    // the torrents still exist. Queued reads are cancelled. The workers
+    // post their completions to this thread's work queue, so run it now:
+    // otherwise they would run only after the torrents below are freed and
+    // their resume files saved, losing every block and check that landed.
     this->local_data.shutdown();
+    session_thread_->run_queued();
 
     // Close the torrents in order of most active to least active
     // so that the most important announce=stopped events are

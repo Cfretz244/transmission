@@ -176,8 +176,10 @@ public:
     // Call when the torrent is freed, so its files are not touched after it is gone.
     void forget(tr_torrent_id_t id);
 
-    // Stops accepting reads and tests, cancels the queued ones, and blocks
-    // until every queued write, move, rename and remove has run.
+    // Stops accepting reads and cancels the queued ones, then blocks until
+    // every queued write, piece check, move, rename and remove has run.
+    // Their completions are dispatched as usual; a caller on the session
+    // thread must run its work queue afterwards to see them.
     void shutdown();
 
     // Bytes in queued writes that have not reached the backend yet.

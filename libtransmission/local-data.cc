@@ -556,7 +556,7 @@ public:
                 auto it = std::begin(queue);
                 while (it != std::end(queue))
                 {
-                    if (!is_read_like(it->op))
+                    if (!is_cancelled_at_shutdown(it->op))
                     {
                         ++it;
                         continue;
@@ -626,7 +626,7 @@ private:
             release_write_bytes_unlocked(task.id, task.write_bytes);
         }
 
-        if (!is_read_like(task.op))
+        if (!is_cancelled_at_shutdown(task.op))
         {
             --pending_non_read_;
         }
@@ -669,7 +669,7 @@ private:
         {
             auto const lock = std::lock_guard(mutex_);
 
-            if (shutting_down_ && is_read_like(task.op))
+            if (shutting_down_ && is_cancelled_at_shutdown(task.op))
             {
                 cancel = std::move(task.cancel);
             }
@@ -681,7 +681,7 @@ private:
                     enqueued_write_bytes_by_id_[task.id] += task.write_bytes;
                 }
 
-                if (!is_read_like(task.op))
+                if (!is_cancelled_at_shutdown(task.op))
                 {
                     ++pending_non_read_;
                 }
@@ -735,7 +735,7 @@ private:
             it->second.pop_front();
             active_ids_.insert(id);
 
-            if (!is_read_like(setme.op))
+            if (!is_cancelled_at_shutdown(setme.op))
             {
                 --pending_non_read_;
                 ++active_non_read_;
@@ -787,7 +787,7 @@ private:
                     release_write_bytes_unlocked(task.id, task.write_bytes);
                 }
 
-                if (!is_read_like(task.op))
+                if (!is_cancelled_at_shutdown(task.op))
                 {
                     --active_non_read_;
                     if (shutting_down_ && pending_non_read_ == 0U && active_non_read_ == 0U)
@@ -811,9 +811,13 @@ private:
         }
     }
 
-    [[nodiscard]] static bool is_read_like(Op const op)
+    // Peer reads are pointless once the session is closing, so shutdown
+    // cancels them. Everything else is drained: writes and moves so the
+    // data lands, piece checks so a piece whose last block arrived just
+    // before close is verified rather than dropped from the resume file.
+    [[nodiscard]] static bool is_cancelled_at_shutdown(Op const op)
     {
-        return op == Op::Read || op == Op::Test;
+        return op == Op::Read;
     }
 
     std::unique_ptr<Backend> backend_;

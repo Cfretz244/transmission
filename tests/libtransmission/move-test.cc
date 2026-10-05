@@ -428,6 +428,63 @@ TEST_F(BlockWrittenTest, blockWhoseWriteFailedIsNotHeld)
     tr_torrentRemove(tor, true);
 }
 
+// A piece whose last block lands just before the session closes still has
+// its hash check queued. Closing must let that check finish and record its
+// answer before the torrent's resume file is saved, so the piece is held
+// after a restart instead of downloaded again (or, worse, saved unverified).
+// The 32 KiB check usually wins the race against close even without that,
+// so LocalData.ShutdownDrainsPieceTests is the deterministic guard; this
+// covers the session-level path end to end.
+TEST_F(BlockWrittenTest, pieceCheckedAtCloseIsHeldAfterRestart)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Partial);
+    ASSERT_FALSE(tor->has_piece(0U));
+    auto const [begin, end] = tor->block_span_for_piece(0);
+
+    // write every block of piece 0, holding back the last on_block_received
+    for (tr_block_index_t block = begin; block < end; ++block)
+    {
+        auto data = WriteData{};
+        data.session = session_;
+        data.tor = tor;
+        data.block = block;
+        data.buf = std::make_unique<tr::LocalData::BlockData>(tr_block_info::BlockSize);
+        std::fill_n(std::data(*data.buf), tr_block_info::BlockSize, '\0');
+        auto const is_last = block + 1U == end;
+        session_->run_in_session_thread(
+            [](WriteData* data_ptr, bool const skip_receive)
+            {
+                data_ptr->session->local_data.write(
+                    data_ptr->tor->make_io_plan(data_ptr->tor->block_info().byte_span_for_block(data_ptr->block)),
+                    std::move(data_ptr->buf),
+                    [data_ptr, skip_receive](tr_torrent_id_t, tr_byte_span_t, tr_error const& error, bool)
+                    {
+                        EXPECT_FALSE(error) << error;
+                        if (!skip_receive)
+                        {
+                            data_ptr->tor->on_block_received(data_ptr->block);
+                        }
+                        data_ptr->done = true;
+                    });
+            },
+            &data,
+            is_last);
+        EXPECT_TRUE(waitFor([&data]() { return data.done; }, MaxWaitMsec));
+    }
+
+    // queue the check and close the session right behind it
+    session_->run_in_session_thread([tor, last = end - 1U]() { tor->on_block_received(last); });
+    restartSession();
+
+    // the resume file written at close must hold the verified piece
+    auto* const ctor = zeroTorrentCtor();
+    auto* const reloaded = tr_torrentNew(ctor, nullptr);
+    tr_ctorFree(ctor);
+    ASSERT_NE(nullptr, reloaded);
+    EXPECT_TRUE(reloaded->has_piece(0U));
+    EXPECT_TRUE(reloaded->has_all());
+}
+
 INSTANTIATE_TEST_SUITE_P(
     IncompleteDir,
     IncompleteDirTest,

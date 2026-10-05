@@ -688,6 +688,48 @@ TEST(LocalData, ForgetDiscardsQueuedWorkButKeepsRemove)
     EXPECT_EQ((std::vector<std::string>{ "1:read", "1:close_torrent", "1:remove" }), raw_backend->log());
 }
 
+// A piece check queued behind a write must survive shutdown: cancelling
+// it would leave a piece on disk that is never verified and never saved.
+TEST(LocalData, ShutdownDrainsPieceTests)
+{
+    auto backend = std::make_unique<StubBackend>();
+    auto* raw_backend = backend.get();
+    backend->hold(1);
+    auto local_data = tr::LocalData{ std::move(backend), {}, 1U };
+
+    auto write_result = std::promise<tr_error_code_t>{};
+    auto write_future = write_result.get_future();
+    auto data = std::make_unique<tr::LocalData::BlockData>();
+    data->assign({ uint8_t{ 1U } });
+    local_data.write(
+        make_plan(1, { .begin = 0U, .end = 1U }),
+        std::move(data),
+        [&](auto, auto, tr_error const& error, auto) { write_result.set_value(error.code()); });
+    ASSERT_TRUE(raw_backend->wait_until_running(1));
+
+    auto test_result = std::promise<tr_error_code_t>{};
+    auto test_future = test_result.get_future();
+    local_data.test_piece(
+        make_plan(1, { .begin = 0U, .end = 3U }),
+        0U,
+        [&](auto, auto, tr_error const& error, auto) { test_result.set_value(error.code()); });
+
+    auto releaser = std::thread(
+        [raw_backend]()
+        {
+            std::this_thread::sleep_for(100ms);
+            raw_backend->release(1);
+        });
+    local_data.shutdown();
+    releaser.join();
+
+    ASSERT_TRUE(wait_for(write_future));
+    EXPECT_EQ(0, write_future.get());
+    ASSERT_TRUE(wait_for(test_future));
+    EXPECT_EQ(0, test_future.get());
+    EXPECT_EQ((std::vector<std::string>{ "1:write", "1:test" }), raw_backend->log());
+}
+
 TEST(LocalData, ShutdownDrainsWritesAndCancelsReads)
 {
     auto backend = std::make_unique<StubBackend>();

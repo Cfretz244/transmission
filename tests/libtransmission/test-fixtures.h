@@ -550,6 +550,15 @@ protected:
         tr_logClearQueue();
     }
 
+    // Closes the fixture's session and starts another on the same config
+    // dir, as a restart would. Torrents must be added again by the caller;
+    // their resume files are picked up.
+    void restartSession()
+    {
+        closeSession();
+        session_ = sessionInit(*settings());
+    }
+
     void SetUp() override
     {
         SandboxedTest::SetUp();

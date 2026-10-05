@@ -223,6 +223,24 @@ public:
         }
     }
 
+    void run_queued() override
+    {
+        TR_ASSERT(am_in_session_thread());
+
+        for (;;)
+        {
+            {
+                auto const lock = std::lock_guard(work_queue_mutex_);
+                if (std::empty(work_queue_))
+                {
+                    return;
+                }
+            }
+
+            on_work_available();
+        }
+    }
+
 private:
     using work_queue_t = std::list<callback_t>;
 
