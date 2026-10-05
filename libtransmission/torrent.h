@@ -860,6 +860,20 @@ struct tr_torrent
 
     void start(bool bypass_queue, std::optional<bool> has_any_local_data);
 
+    // The tail of init(): the first look at the torrent's files.
+    void finish_init(bool is_new_torrent, std::optional<bool> has_any_local_data);
+
+    // Set while a removed torrent's files are still being deleted under
+    // this torrent's path (see tr_session::deleting_paths_). finish_init()
+    // runs with these arguments when the delete completes; until then the
+    // torrent does not look at, start on, or verify its files.
+    struct DeferredInit
+    {
+        bool is_new_torrent = false;
+        std::optional<bool> has_any_local_data;
+    };
+    std::optional<DeferredInit> deferred_init_;
+
     [[nodiscard]] constexpr auto has_changed_since(time_t when) const noexcept
     {
         return date_changed_ > when;

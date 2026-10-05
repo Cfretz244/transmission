@@ -1306,6 +1306,13 @@ public:
     // depends-on: open_files_, session_thread_
     tr::LocalData local_data{ open_files_, [this](std::function<void()> func) { run_in_session_thread(std::move(func)); } };
 
+    // Top-level paths (`parent/name`) whose files tr_torrentRemove() is
+    // still deleting on a LocalData worker. Guarded by the session lock.
+    // A torrent added onto one of these paths waits for the delete before
+    // it looks at its files, so the old files cannot make it complete and
+    // announce `left=0` for data that is about to vanish.
+    std::vector<std::string> deleting_paths_;
+
 private:
     // depends-on: settings_, session_thread_, timer_maker_, web_
     IPCacheMediator ip_cache_mediator_{ *this };

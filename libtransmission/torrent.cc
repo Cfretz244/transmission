@@ -198,6 +198,46 @@ bool set_local_error_if_files_disappeared(tr_torrent* tor, std::optional<bool> h
     return files_disappeared;
 }
 
+// True if a removed torrent's files are still being deleted where this
+// torrent would look for its own. See tr_session::deleting_paths_.
+bool is_path_being_deleted(tr_torrent const* tor)
+{
+    auto const& paths = tor->session->deleting_paths_;
+    auto const matches = [&paths, name = tor->name()](std::string_view const dir)
+    {
+        return !std::empty(dir) && std::ranges::find(paths, tr_pathbuf{ dir, '/', name }.sv()) != std::end(paths);
+    };
+    return matches(tor->download_dir().sv()) || matches(tor->incomplete_dir().sv());
+}
+
+// The delete of the files at `path` has finished: let any torrent added
+// onto that path in the meantime take its first look at its files.
+void on_files_deleted(tr_session* session, std::string const& path)
+{
+    auto const lock = session->unique_lock();
+
+    auto& paths = session->deleting_paths_;
+    if (auto const it = std::ranges::find(paths, path); it != std::end(paths))
+    {
+        paths.erase(it);
+    }
+
+    if (session->isClosing())
+    {
+        return;
+    }
+
+    for (auto* const tor : session->torrents())
+    {
+        if (tor->deferred_init_ && !is_path_being_deleted(tor))
+        {
+            auto const deferred = *tor->deferred_init_;
+            tor->deferred_init_.reset();
+            tor->finish_init(deferred.is_new_torrent, deferred.has_any_local_data);
+        }
+    }
+}
+
 /* returns true if the seed ratio applies --
  * it applies if the torrent's a seed AND it has a seed ratio set */
 bool tr_torrentGetSeedRatioBytes(tr_torrent const* tor, uint64_t* setme_left, uint64_t* setme_goal)
@@ -609,6 +649,11 @@ void tr_torrent::start(bool bypass_queue, std::optional<bool> has_any_local_data
 
     auto const lock = unique_lock();
 
+    if (deferred_init_)
+    {
+        return; // finish_init() starts it if start_when_stable_
+    }
+
     switch (activity())
     {
     case TR_STATUS_SEED:
@@ -740,6 +785,11 @@ void tr_torrentRemoveInSessionThread(
     {
         tor->session->verify_remove(tor);
 
+        // A torrent added onto this path before the delete finishes
+        // waits for it; see is_path_being_deleted().
+        auto path = std::string{ tr_pathbuf{ tor->current_dir(), '/', tor->name() } };
+        tor->session->deleting_paths_.emplace_back(path);
+
         // LocalData deletes the files after the torrent's in-flight write,
         // so that write cannot recreate a file once it is deleted.
         tor->session->local_data.remove(
@@ -748,7 +798,9 @@ void tr_torrentRemoveInSessionThread(
             tor->current_dir().sv(),
             tor->name(),
             std::move(remove_func),
-            [name = std::string{ tor->name() }](tr_torrent_id_t /*tor_id*/, tr_error const& error)
+            [session = tor->session,
+             path = std::move(path),
+             name = std::string{ tor->name() }](tr_torrent_id_t /*tor_id*/, tr_error const& error)
             {
                 if (error)
                 {
@@ -759,6 +811,8 @@ void tr_torrentRemoveInSessionThread(
                             fmt::arg("error_code", error.code())),
                         name);
                 }
+
+                on_files_deleted(session, path);
             });
     }
 
@@ -1117,6 +1171,28 @@ void tr_torrent::init(tr_ctor const& ctor)
 
     torrent_announcer = session->announcer_->addTorrent(this, &tr_torrent::on_tracker_response);
 
+    if (is_path_being_deleted(this))
+    {
+        // A removed torrent's files are still being deleted under this
+        // path. Looking at them now would make this torrent complete and
+        // announce `left=0` for data about to vanish, so wait for the
+        // delete (see on_files_deleted()).
+        deferred_init_ = DeferredInit{ is_new_torrent, has_any_local_data };
+    }
+    else
+    {
+        finish_init(is_new_torrent, has_any_local_data);
+    }
+
+    // Recover from the bug reported at https://github.com/transmission/transmission/issues/6899
+    if (is_done() && date_done_ == time_t{})
+    {
+        date_done_ = now_sec;
+    }
+}
+
+void tr_torrent::finish_init(bool const is_new_torrent, std::optional<bool> const has_any_local_data)
+{
     if (auto const has_metainfo = this->has_metainfo(); is_new_torrent && has_metainfo)
     {
         on_metainfo_completed();
@@ -1129,12 +1205,6 @@ void tr_torrent::init(tr_ctor const& ctor)
     else
     {
         set_local_error_if_files_disappeared(this, has_any_local_data);
-    }
-
-    // Recover from the bug reported at https://github.com/transmission/transmission/issues/6899
-    if (is_done() && date_done_ == time_t{})
-    {
-        date_done_ = now_sec;
     }
 }
 
@@ -1760,6 +1830,11 @@ void tr_torrentVerify(tr_torrent* tor)
             if (tor != session->torrents().get(tor_id) || tor->is_deleting_)
             {
                 return;
+            }
+
+            if (tor->deferred_init_)
+            {
+                return; // its files are still being deleted; finish_init() checks them
             }
 
             session->verify_remove(tor);
