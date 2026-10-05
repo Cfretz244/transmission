@@ -1292,6 +1292,14 @@ private:
     void set_has_piece(tr_piece_index_t piece, bool has)
     {
         completion_.set_has_piece(piece, has);
+
+        if (!has)
+        {
+            for (auto [file, file_end] = fpm_.file_span_for_piece(piece); file < file_end; ++file)
+            {
+                files_completed_.set(file, false);
+            }
+        }
     }
 
     constexpr void bump_date_changed(time_t when)
@@ -1374,6 +1382,13 @@ private:
 
     // when Transmission thinks the torrent's files were last changed
     std::vector<time_t> file_mtimes_;
+
+    // Files whose completion has been handled by on_file_completed().
+    // Piece hash results arrive asynchronously, so several pieces of a
+    // file can finish after all of its blocks are already present; this
+    // keeps the file-completed work from running once per such piece.
+    // Cleared for a file whenever one of its pieces is marked missing.
+    tr_bitfield files_completed_ = tr_bitfield{ 0 };
 
     tr_interned_string bandwidth_group_;
 

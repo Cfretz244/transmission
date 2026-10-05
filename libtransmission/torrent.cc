@@ -859,6 +859,7 @@ void tr_torrent::on_metainfo_updated()
     file_priorities_ = tr_file_priorities{ &fpm_ };
     files_wanted_ = tr_files_wanted{ &fpm_ };
     checked_pieces_ = tr_bitfield{ size_t(piece_count()) };
+    files_completed_ = tr_bitfield{ size_t(file_count()) };
 }
 
 void tr_torrent::on_metainfo_completed()
@@ -2207,8 +2208,9 @@ void tr_torrent::on_piece_completed(tr_piece_index_t const piece)
     // if this piece completes any file, invoke the fileCompleted func for it
     for (auto [file, file_end] = fpm_.file_span_for_piece(piece); file < file_end; ++file)
     {
-        if (has_file(file))
+        if (has_file(file) && !files_completed_.test(file))
         {
+            files_completed_.set(file, true);
             on_file_completed(file);
         }
     }
