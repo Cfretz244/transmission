@@ -37,6 +37,7 @@
 #include "libtransmission/interned-string.h"
 #include "libtransmission/log.h"
 #include "libtransmission/session.h"
+#include "libtransmission/timer.h"
 #include "libtransmission/torrent-files.h"
 #include "libtransmission/torrent-magnet.h"
 #include "libtransmission/torrent-metainfo.h"
@@ -378,6 +379,27 @@ struct tr_torrent
     {
         return n_pending_piece_tests_ != 0U;
     }
+
+    // Disk work that will credit `downloaded` when it lands: blocks being
+    // written and pieces being hashed. Session thread only.
+    [[nodiscard]] bool has_pending_disk_work() const noexcept
+    {
+        return has_pending_piece_tests() || !std::empty(blocks_being_written_);
+    }
+
+    // A stop with disk work pending holds its `stopped` announce until the
+    // work has answered (or StopAnnounceCap passes), so the tracker's session
+    // total includes the credit. See stop_now().
+    [[nodiscard]] constexpr bool is_stop_announce_deferred() const noexcept
+    {
+        return stop_announce_deferred_;
+    }
+
+    static auto constexpr StopAnnounceCap = std::chrono::seconds{ 10 };
+
+    // Sends the held `stopped` announce if nothing is pending any more.
+    // Called when a write or a piece check has answered.
+    void send_deferred_stop_announce_if_idle();
 
     [[nodiscard]] auto size_when_done() const
     {
@@ -1611,6 +1633,12 @@ private:
     // check answered after the stop), so `completed` is owed to the
     // trackers at the next start.
     bool announce_completed_on_start_ = false;
+
+    void send_deferred_stop_announce();
+
+    // See is_stop_announce_deferred(). Session thread only.
+    bool stop_announce_deferred_ = false;
+    std::unique_ptr<tr::Timer> stop_announce_timer_;
 
     // Piece hash checks enqueued to LocalData and not yet answered.
     // Both counters are touched only on the session thread.

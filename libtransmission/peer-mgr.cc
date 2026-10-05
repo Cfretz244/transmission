@@ -1919,6 +1919,9 @@ void tr_peerMgrBlockWritten(
     {
         s->on_block_written(peer, source, block, error);
     }
+
+    // after on_block_received() above has queued the piece check, if any
+    tor->send_deferred_stop_announce_if_idle();
 }
 
 void tr_peerMgrAddTorrent(tr_peerMgr* manager, tr_torrent* tor)

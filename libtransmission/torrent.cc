@@ -725,6 +725,14 @@ void tr_torrent::start_in_session_thread()
     bytes_corrupt_.start_new_session();
     set_dirty();
 
+    if (stop_announce_deferred_)
+    {
+        // The stop was never announced, so the trackers still see this
+        // session; `started` below refreshes it, as a port change does.
+        stop_announce_deferred_ = false;
+        stop_announce_timer_->stop();
+    }
+
     session->announcer_->startTorrent(this);
     if (announce_completed_on_start_)
     {
@@ -733,6 +741,28 @@ void tr_torrent::start_in_session_thread()
     }
     lpdAnnounceAt = now;
     started_(this);
+}
+
+void tr_torrent::send_deferred_stop_announce()
+{
+    TR_ASSERT(session->am_in_session_thread());
+
+    if (!stop_announce_deferred_)
+    {
+        return;
+    }
+
+    stop_announce_deferred_ = false;
+    stop_announce_timer_->stop();
+    session->announcer_->stopTorrent(this);
+}
+
+void tr_torrent::send_deferred_stop_announce_if_idle()
+{
+    if (stop_announce_deferred_ && !has_pending_disk_work())
+    {
+        send_deferred_stop_announce();
+    }
 }
 
 void tr_torrent::stop_now()
@@ -756,7 +786,29 @@ void tr_torrent::stop_now()
     session->verify_remove(this);
 
     stopped_(this);
-    session->announcer_->stopTorrent(this);
+
+    if (has_pending_disk_work() && !session->isClosing() && !is_deleting_)
+    {
+        // Blocks still being written and pieces still being hashed credit
+        // `downloaded` when they land, which is after this point. Hold the
+        // `stopped` announce for them, bounded, so the trackers' total for
+        // this session includes them instead of the next one's `started`.
+        stop_announce_deferred_ = true;
+        if (!stop_announce_timer_)
+        {
+            stop_announce_timer_ = session->timerMaker().create([this]() { send_deferred_stop_announce(); });
+        }
+        stop_announce_timer_->start_single_shot(StopAnnounceCap);
+    }
+    else
+    {
+        stop_announce_deferred_ = false;
+        if (stop_announce_timer_)
+        {
+            stop_announce_timer_->stop();
+        }
+        session->announcer_->stopTorrent(this);
+    }
 
     session->local_data.close_torrent(id());
 
@@ -2320,8 +2372,9 @@ void tr_torrent::recheck_completeness()
                 // this can run after the torrent was stopped and `stopped`
                 // already announced. Don't queue `completed` behind that:
                 // send it when the torrent next starts, after `started`.
-                if (is_running())
+                if (is_running() || stop_announce_deferred_)
                 {
+                    // (a held `stopped` goes out after this and keeps it)
                     tr_announcerTorrentCompleted(this);
                 }
                 else
@@ -2702,6 +2755,17 @@ void tr_torrent::on_block_received(tr_block_index_t const block)
             {
                 if (auto* const tor = session->torrents().get(tor_id))
                 {
+                    // whatever this answer does, a held `stopped` announce
+                    // may be waiting on it
+                    struct FlushOnExit
+                    {
+                        tr_torrent* tor;
+                        ~FlushOnExit()
+                        {
+                            tor->send_deferred_stop_announce_if_idle();
+                        }
+                    } const flush{ tor };
+
                     --tor->n_pending_piece_tests_;
                     tor->pending_piece_test_bytes_ -= tor->piece_size(piece);
 

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <ctime>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -13,6 +14,15 @@
 
 #include <utime.h>
 
+#ifndef _WIN32
+#include <fcntl.h>
+#endif
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #include <gtest/gtest.h>
 
 #include <libtransmission/peer-common.h>
@@ -25,6 +35,7 @@
 #include <libtransmission/peer-mgr.h>
 #include <libtransmission/quark.h>
 #include <libtransmission/torrent-files.h>
+#include <libtransmission/string-utils.h>
 #include <libtransmission/torrent.h>
 #include <libtransmission/tr-strbuf.h>
 #include <libtransmission/variant.h>
@@ -416,6 +427,144 @@ TEST_F(BlockWrittenTest, downloadedIsCreditedWithoutTheSender)
 
     tr_torrentRemove(tor, true);
 }
+
+#ifndef _WIN32
+// Stops a running torrent whose disk queue is stalled with every block of
+// piece 0 queued behind the stall, so the stop happens with writes (and
+// then a hash check) pending. Returns the FIFO path that releases the stall
+// and the WriteData the caller must keep alive until the writes land.
+class DeferredStopTest : public BlockWrittenTest
+{
+protected:
+    struct Stalled
+    {
+        tr_pathbuf fifo_path;
+        std::vector<std::unique_ptr<WriteData>> writes;
+        bool stall_answered = false;
+    };
+
+    void stopWithPendingDiskWork(tr_torrent* tor, Stalled& st)
+    {
+        // off the network: a tracker on loopback with nothing listening, so
+        // the announcer has a tier to credit and every announce fails locally
+        tr_sessionSetLPDEnabled(session_, false);
+        ASSERT_TRUE(tr_torrentSetTrackerList(tor, "http://127.0.0.1:1/announce"sv));
+        tr_torrentStartNow(tor);
+        ASSERT_TRUE(waitFor([tor]() { return tor->is_running(); }, MaxWaitMsec));
+
+        auto const fifo_name = "stall.fifo"sv;
+        st.fifo_path = tr_pathbuf{ tr_sessionGetDownloadDir(session_), '/', fifo_name };
+        ASSERT_EQ(0, mkfifo(st.fifo_path.c_str(), 0600)) << tr_strerror(errno);
+        auto stall_plan = makeIoPlan(tor);
+        ASSERT_EQ(1U, std::size(stall_plan.files));
+        stall_plan.files[0].index = tor->file_count() + 1U;
+        stall_plan.files[0].subpath = fifo_name;
+        session_->local_data.read(
+            std::move(stall_plan),
+            [&st](tr_torrent_id_t, tr_byte_span_t, tr_error const&, std::unique_ptr<tr::LocalData::BlockData>)
+            { st.stall_answered = true; });
+
+        auto const [begin, end] = tor->block_span_for_piece(0U);
+        for (auto block = begin; block < end; ++block)
+        {
+            auto data = std::make_unique<WriteData>();
+            data->session = session_;
+            data->tor = tor;
+            data->block = block;
+            data->buf = std::make_unique<tr::LocalData::BlockData>(tr_block_info::BlockSize);
+            std::fill_n(std::data(*data->buf), tr_block_info::BlockSize, '\0');
+            data->source = tr_block_source::Peer;
+            session_->run_in_session_thread(write_from_departed_peer, data.get());
+            st.writes.emplace_back(std::move(data));
+        }
+        auto queued = false;
+        session_->run_in_session_thread([tor, end = end, &queued]() { queued = tor->is_block_write_pending(end - 1U); });
+        ASSERT_TRUE(waitFor([&queued]() { return queued; }, MaxWaitMsec));
+
+        tr_torrentStop(tor);
+        ASSERT_TRUE(waitFor([tor]() { return !tor->is_running(); }, MaxWaitMsec));
+    }
+
+    // stop_now() and start_in_session_thread() flip is_running() a few
+    // statements before they touch the deferral flag, so read the flag on
+    // the session thread, where it is always consistent with the torrent.
+    [[nodiscard]] bool isStopAnnounceDeferred(tr_torrent* tor)
+    {
+        auto value = std::optional<bool>{};
+        session_->run_in_session_thread([tor, &value]() { value = tor->is_stop_announce_deferred(); });
+        EXPECT_TRUE(waitFor([&value]() { return value.has_value(); }, MaxWaitMsec));
+        return value.value_or(false);
+    }
+
+    void releaseStall(Stalled& st)
+    {
+        auto const writer = open(st.fifo_path.c_str(), O_WRONLY);
+        ASSERT_NE(-1, writer) << tr_strerror(errno);
+        close(writer);
+        EXPECT_TRUE(waitFor(
+            [&st]() { return st.stall_answered && std::ranges::all_of(st.writes, [](auto const& w) { return w->done; }); },
+            MaxWaitMsec));
+    }
+};
+
+// A stop with writes and hash checks still pending holds its `stopped`
+// announce until they have answered, so the credit for the piece they
+// complete is reported in the session that downloaded it rather than
+// riding into the next session's `started`.
+TEST_F(DeferredStopTest, stoppedAnnounceWaitsForPendingPieceCredit)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Partial);
+    auto st = Stalled{};
+    stopWithPendingDiskWork(tor, st);
+
+    EXPECT_TRUE(isStopAnnounceDeferred(tor));
+    EXPECT_EQ(0U, tr_announcerGetBytes(tor, TR_ANN_DOWN));
+
+    releaseStall(st);
+    EXPECT_TRUE(waitFor([this, tor]() { return !isStopAnnounceDeferred(tor); }, MaxWaitMsec));
+    EXPECT_TRUE(tor->has_piece(0U));
+    EXPECT_EQ(tor->piece_size(0U), tr_announcerGetBytes(tor, TR_ANN_DOWN));
+    EXPECT_FALSE(tor->is_running());
+
+    tr_torrentRemove(tor, true);
+}
+
+// A wedged disk must not hold the `stopped` announce forever.
+TEST_F(DeferredStopTest, deferredStoppedAnnounceIsCapped)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Partial);
+    auto st = Stalled{};
+    stopWithPendingDiskWork(tor, st);
+    EXPECT_TRUE(isStopAnnounceDeferred(tor));
+
+    auto const cap_ms = std::chrono::duration_cast<std::chrono::milliseconds>(tr_torrent::StopAnnounceCap).count();
+    EXPECT_TRUE(waitFor([this, tor]() { return !isStopAnnounceDeferred(tor); }, static_cast<int>(cap_ms) + MaxWaitMsec));
+    EXPECT_FALSE(tor->is_running());
+
+    releaseStall(st);
+    tr_torrentRemove(tor, true);
+}
+
+// Starting again before the held `stopped` went out drops it: the trackers
+// never saw a stop, and `started` refreshes the session they still see.
+TEST_F(DeferredStopTest, restartCancelsDeferredStoppedAnnounce)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Partial);
+    auto st = Stalled{};
+    stopWithPendingDiskWork(tor, st);
+    EXPECT_TRUE(isStopAnnounceDeferred(tor));
+
+    tr_torrentStartNow(tor);
+    EXPECT_TRUE(waitFor([tor]() { return tor->is_running(); }, MaxWaitMsec));
+    EXPECT_FALSE(isStopAnnounceDeferred(tor));
+
+    releaseStall(st);
+    EXPECT_TRUE(waitFor([tor]() { return !tor->has_pending_disk_work(); }, MaxWaitMsec));
+    EXPECT_FALSE(isStopAnnounceDeferred(tor));
+
+    tr_torrentRemove(tor, true);
+}
+#endif
 
 // Webseed downloads don't belong in announce totals.
 TEST_F(BlockWrittenTest, webseedBlocksAreNotCreditedAsDownloaded)
