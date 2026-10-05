@@ -60,7 +60,10 @@ public:
     [[nodiscard]] tr_io_result read(tr_io_plan const& plan, tr::LocalData::BlockData& setme) override
     {
         auto const guard = Running{ *this, plan.tor_id, "read" };
-        read_span = plan.byte_span;
+        {
+            auto const lock = std::lock_guard{ mutex_ };
+            read_span = plan.byte_span;
+        }
         setme.assign({ uint8_t{ 1U }, uint8_t{ 2U }, uint8_t{ 3U } });
         return make_result(read_err);
     }
@@ -68,7 +71,10 @@ public:
     [[nodiscard]] tr_io_result test_piece(tr_io_plan const& plan, tr_sha1_digest_t& setme_hash) override
     {
         auto const guard = Running{ *this, plan.tor_id, "test" };
-        tested_span = plan.byte_span;
+        {
+            auto const lock = std::lock_guard{ mutex_ };
+            tested_span = plan.byte_span;
+        }
         setme_hash = hash;
         return make_result(test_err);
     }
@@ -76,7 +82,10 @@ public:
     [[nodiscard]] tr_io_result write(tr_io_plan const& plan, tr::LocalData::BlockData const& data) override
     {
         auto const guard = Running{ *this, plan.tor_id, "write" };
-        write_span = plan.byte_span;
+        {
+            auto const lock = std::lock_guard{ mutex_ };
+            write_span = plan.byte_span;
+        }
         last_write.assign(std::begin(data), std::end(data));
         auto result = make_result(write_err);
         result.created_file = write_creates_file;

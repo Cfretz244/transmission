@@ -220,8 +220,17 @@ tr_verify_worker::~tr_verify_worker()
         todo_.clear();
     }
 
-    while (verify_thread_id_.has_value())
+    // The verify thread clears verify_thread_id_ under verify_mutex_ on its
+    // way out, so read it under the lock too.
+    for (;;)
     {
+        {
+            auto const lock = std::scoped_lock{ verify_mutex_ };
+            if (!verify_thread_id_.has_value())
+            {
+                return;
+            }
+        }
         std::this_thread::sleep_for(20ms);
     }
 }

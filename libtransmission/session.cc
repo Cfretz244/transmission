@@ -689,7 +689,7 @@ void tr_session::refresh_free_space_cache()
             auto const lock = std::scoped_lock{ cache->mutex };
             cache->path = std::move(dir);
             cache->available_bytes = capacity ? static_cast<int64_t>(capacity->available) : int64_t{ -1 };
-            cache->updated_at = tr_time();
+            cache->updated_at = time(nullptr); // not tr_time(): its cache is the session thread's
             cache->refresh_in_flight = false;
         })
         .detach();

@@ -192,7 +192,10 @@ struct tr_torrent
         // Runs `func` on the session thread against this verify's torrent,
         // unless the torrent is gone, is being deleted, or has been pulled
         // off the verifier since this verify was queued.
-        void post(std::function<void(tr_torrent&)> func) const;
+        // Runs `func` on the session thread under the session lock, if the
+        // torrent is still there and this verify is still current; then
+        // `unlocked`, if given, with the lock released.
+        void post(std::function<void(tr_torrent&)> func, std::function<void(tr_torrent&)> unlocked = {}) const;
 
         void flush_checked_pieces();
 

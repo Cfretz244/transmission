@@ -1908,12 +1908,16 @@ bool tr_torrent::VerifyMediator::is_complete_copy_on_disk() const
     return true;
 }
 
-void tr_torrent::VerifyMediator::post(std::function<void(tr_torrent&)> func) const
+void tr_torrent::VerifyMediator::post(std::function<void(tr_torrent&)> func, std::function<void(tr_torrent&)> unlocked) const
 {
     poster_->post(
-        [session = session_, tor_id = tor_id_, generation = generation_, func = std::move(func)]()
+        [session = session_,
+         tor_id = tor_id_,
+         generation = generation_,
+         func = std::move(func),
+         unlocked = std::move(unlocked)]()
         {
-            auto const lock = session->unique_lock();
+            auto lock = session->unique_lock();
 
             auto* const tor = session->torrents().get(tor_id);
             if (tor == nullptr || tor->is_deleting_ || tor->verify_generation_ != generation)
@@ -1922,6 +1926,19 @@ void tr_torrent::VerifyMediator::post(std::function<void(tr_torrent&)> func) con
             }
 
             func(*tor);
+
+            if (!unlocked)
+            {
+                return;
+            }
+
+            // The app's verify-done callback runs without the session lock,
+            // as upstream does: an app may take its own lock in it and call
+            // libtransmission (which takes the session lock) elsewhere while
+            // holding that lock. `tor` stays valid: torrents are freed on
+            // this thread only.
+            lock.unlock();
+            unlocked(*tor);
         });
 }
 
@@ -2064,7 +2081,9 @@ void tr_torrent::VerifyMediator::on_new_seed_found()
             tor.set_verify_state(VerifyState::None);
             tor.recheck_completeness();
             tor.date_done_ = tor.date_added_; // Must be after recheck_completeness()
-
+        },
+        [](tr_torrent& tor)
+        {
             if (tor.verify_done_callback_)
             {
                 tor.verify_done_callback_(&tor);
@@ -2124,7 +2143,9 @@ void tr_torrent::VerifyMediator::on_verify_done(bool const aborted, bool const f
             }
 
             tor.recheck_completeness();
-
+        },
+        [](tr_torrent& tor)
+        {
             if (tor.verify_done_callback_)
             {
                 tor.verify_done_callback_(&tor);
