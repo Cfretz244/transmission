@@ -34,6 +34,7 @@
 #include "libtransmission/block-info.h" // tr_block_info
 #include "libtransmission/clients.h"
 #include "libtransmission/crypto-utils.h"
+#include "libtransmission/error.h"
 #include "libtransmission/handshake.h"
 #include "libtransmission/interned-string.h"
 #include "libtransmission/local-data.h"
@@ -733,6 +734,32 @@ public:
         return introducer_store_;
     }
 
+
+    // See tr_peerMgrBlockWritten()
+    void on_block_written(tr_peer* const peer, tr_block_index_t const block, tr_error const& error)
+    {
+        auto const lock = unique_lock();
+
+        if (error)
+        {
+            // The block never reached disk. It left every peer's active
+            // requests when it was received, so put it back on the wishlist.
+            got_reject(tor, peer, block);
+            return;
+        }
+
+        cancel_all_requests_for_block(block, peer);
+
+        if (peer != nullptr)
+        {
+            peer->blocks_sent_to_client.add(tr_time(), 1);
+            peer->blame.set(tor->block_loc(block).piece);
+        }
+
+        got_block(tor, block); // put this line before calling tr_torrent callback
+        tor->on_block_received(block);
+    }
+
     sigslot::signal<tr_torrent*, tr_bitfield const& /*bitfield*/, tr_bitfield const& /*active requests*/> peer_disconnect;
     sigslot::signal<tr_torrent*, tr_bitfield const&> got_bitfield;
     sigslot::signal<tr_torrent*, tr_block_index_t> got_block;
@@ -971,11 +998,7 @@ private:
             {
                 auto* const tor = s->tor;
                 auto const loc = tor->piece_loc(event.pieceIndex, event.offset);
-                s->cancel_all_requests_for_block(loc.block, peer);
-                peer->blocks_sent_to_client.add(tr_time(), 1);
-                peer->blame.set(loc.piece);
-                s->got_block(tor, loc.block); // put this line before calling tr_torrent callback
-                tor->on_block_received(loc.block);
+                tr_peerMgrBlockWritten(tor, peer, loc.block, {});
             }
             break;
 
@@ -1867,6 +1890,17 @@ void tr_swarm::on_torrent_started()
 void tr_swarm::on_torrent_stopped()
 {
     stop();
+}
+
+void tr_peerMgrBlockWritten(tr_torrent* const tor, tr_peer* const peer, tr_block_index_t const block, tr_error const& error)
+{
+    TR_ASSERT(tr_isTorrent(tor));
+    TR_ASSERT(tor->session->am_in_session_thread());
+
+    if (auto* const s = tor->swarm; s != nullptr)
+    {
+        s->on_block_written(peer, block, error);
+    }
 }
 
 void tr_peerMgrAddTorrent(tr_peerMgr* manager, tr_torrent* tor)

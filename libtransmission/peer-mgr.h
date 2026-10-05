@@ -32,6 +32,7 @@
 
 class tr_peerMsgs;
 class tr_peer_socket;
+struct tr_error;
 struct tr_peer;
 struct tr_peerMgr;
 struct tr_peer_stat;
@@ -730,6 +731,14 @@ enum : uint8_t
     size_t max_peer_count);
 
 void tr_peerMgrAddTorrent(tr_peerMgr* manager, struct tr_torrent* tor);
+
+/**
+ * Called on the session thread when a block's write to local data has
+ * finished. `peer` is the peer or webseed that sent the block, or nullptr
+ * if it has disconnected since: the block still belongs to the torrent.
+ * On `error` the block never reached disk and is made requestable again.
+ */
+void tr_peerMgrBlockWritten(tr_torrent* tor, tr_peer* peer, tr_block_index_t block, tr_error const& error);
 
 // return the number of connected peers that have `piece`, or -1 if we already have it
 [[nodiscard]] int8_t tr_peerMgrPieceAvailability(tr_torrent const* tor, tr_piece_index_t piece);

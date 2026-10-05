@@ -341,6 +341,13 @@ public:
         }
     }
 
+    // Expires when this object is destroyed. A completion callback that
+    // captured a raw pointer to this checks it before use.
+    [[nodiscard]] std::weak_ptr<void> liveness() const noexcept
+    {
+        return alive_;
+    }
+
     tr_torrent& tor;
     std::string const base_url;
 
@@ -358,6 +365,8 @@ private:
 
     tr_peer_callback_webseed const callback_;
     void* const callback_data_;
+
+    std::shared_ptr<void> const alive_ = std::make_shared<char>();
 
     bool is_banned_ = false;
 };
@@ -387,7 +396,6 @@ void tr_webseed_task::use_fetched_blocks()
         }
         else
         {
-            auto event = tr_peer_event::GotBlock(block_info, block);
             auto block_data = std::make_shared<tr::LocalData::BlockData>(block_size);
             content_.to_buf(std::data(*block_data), std::size(*block_data));
             session_->run_in_session_thread(
@@ -396,9 +404,14 @@ void tr_webseed_task::use_fetched_blocks()
                  block,
                  byte_span,
                  block_data = std::move(block_data),
-                 event,
-                 webseed = webseed_]()
+                 webseed = webseed_,
+                 alive = webseed_->liveness()]()
                 {
+                    if (alive.expired())
+                    {
+                        return;
+                    }
+
                     webseed->active_requests.unset(block);
                     auto const* const torrent = session->torrents().get(tor_id);
                     if (torrent == nullptr)
@@ -406,11 +419,19 @@ void tr_webseed_task::use_fetched_blocks()
                         return;
                     }
 
+                    // The write finishes later on the session thread. By
+                    // then this webseed may be gone (its swarm rebuilt, or
+                    // the torrent freed), so check before touching it; the
+                    // block still belongs to the torrent either way.
                     auto on_written =
-                        [session, event, webseed](tr_torrent_id_t id, tr_byte_span_t, tr_error const& error, bool created_file)
+                        [session, block, webseed, alive](tr_torrent_id_t id, tr_byte_span_t, tr_error const& error, bool created_file)
                     {
                         tr_torrent::on_local_write_done(*session, id, error, created_file);
-                        session->run_in_session_thread([event, webseed]() { webseed->publish(event); });
+
+                        if (auto* const tor = session->torrents().get(id); tor != nullptr)
+                        {
+                            tr_peerMgrBlockWritten(tor, alive.expired() ? nullptr : webseed, block, error);
+                        }
                     };
                     session->local_data.write(
                         torrent->make_io_plan(byte_span),

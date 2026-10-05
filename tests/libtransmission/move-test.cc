@@ -17,6 +17,7 @@
 #include <libtransmission/block-info.h>
 #include <libtransmission/file.h> // tr_sys_path_*()
 #include <libtransmission/local-data.h>
+#include <libtransmission/peer-mgr.h>
 #include <libtransmission/quark.h>
 #include <libtransmission/torrent-files.h>
 #include <libtransmission/torrent.h>
@@ -322,6 +323,106 @@ TEST_F(CorruptPieceTest, dropsPieceWhenCheckCannotReadIt)
     EXPECT_EQ(piece_bytes, tr_torrentStat(tor).left_until_done);
     EXPECT_EQ(0U, tor->unverified_bytes());
     EXPECT_FALSE(tor->is_done());
+    EXPECT_TRUE(tor->error().is_local_error());
+
+    tr_torrentRemove(tor, true);
+}
+
+class BlockWrittenTest : public SessionTest
+{
+protected:
+    static auto constexpr MaxWaitMsec = 3000;
+
+    struct WriteData
+    {
+        tr_session* session = {};
+        tr_torrent* tor = {};
+        tr_block_index_t block = {};
+        std::unique_ptr<tr::LocalData::BlockData> buf;
+        std::string bad_dir; // if set, the write is planned into this unusable directory
+        tr_error error;
+        bool done = {};
+    };
+
+    // Writes one block the way peer-msgs and webseed do, except that the
+    // sender is already gone (nullptr) when the write completes.
+    static void write_from_departed_peer(WriteData* data)
+    {
+        auto plan = data->tor->make_io_plan(data->tor->block_info().byte_span_for_block(data->block));
+        if (!std::empty(data->bad_dir))
+        {
+            plan.download_dir = data->bad_dir;
+            plan.incomplete_dir = {};
+            plan.current_dir = data->bad_dir;
+        }
+
+        data->session->local_data.write(
+            std::move(plan),
+            std::move(data->buf),
+            [data](tr_torrent_id_t tor_id, tr_byte_span_t, tr_error const& error, bool created_file)
+            {
+                tr_torrent::on_local_write_done(*data->session, tor_id, error, created_file);
+                if (auto* const tor = data->session->torrents().get(tor_id); tor != nullptr)
+                {
+                    tr_peerMgrBlockWritten(tor, nullptr, data->block, error);
+                }
+                data->error = error;
+                data->done = true;
+            });
+    }
+};
+
+// A peer can disconnect while its block is still queued for writing.
+// The block is the torrent's, not the peer's: it must still be recorded.
+TEST_F(BlockWrittenTest, blockFromDepartedPeerIsStillHeld)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Partial);
+    auto const block = tor->block_span_for_piece(0).begin;
+    ASSERT_FALSE(tor->has_block(block));
+
+    auto data = WriteData{};
+    data.session = session_;
+    data.tor = tor;
+    data.block = block;
+    data.buf = std::make_unique<tr::LocalData::BlockData>(tr_block_info::BlockSize);
+    std::fill_n(std::data(*data.buf), tr_block_info::BlockSize, '\0');
+    session_->run_in_session_thread(write_from_departed_peer, &data);
+    EXPECT_TRUE(waitFor([&data]() { return data.done; }, MaxWaitMsec));
+
+    EXPECT_FALSE(data.error) << data.error;
+    EXPECT_TRUE(tor->has_block(block));
+    EXPECT_FALSE(tor->error().is_local_error());
+
+    tr_torrentRemove(tor, true);
+}
+
+// A block whose write fails never reached disk, so it must not be
+// recorded as held; that would leave a hole that is never re-requested
+// and announce `left` short of the truth.
+TEST_F(BlockWrittenTest, blockWhoseWriteFailedIsNotHeld)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Partial);
+    auto const block = tor->block_span_for_piece(0).begin;
+    auto const had_total = tor->has_total();
+
+    // a regular file where the plan expects a directory, so the write
+    // cannot create its file
+    auto const not_a_dir = tr_pathbuf{ sandboxDir(), "/not-a-dir" };
+    createFileWithContents(not_a_dir, "x");
+
+    auto data = WriteData{};
+    data.session = session_;
+    data.tor = tor;
+    data.block = block;
+    data.buf = std::make_unique<tr::LocalData::BlockData>(tr_block_info::BlockSize);
+    std::fill_n(std::data(*data.buf), tr_block_info::BlockSize, '\0');
+    data.bad_dir = tr_pathbuf{ not_a_dir, "/sub" };
+    session_->run_in_session_thread(write_from_departed_peer, &data);
+    EXPECT_TRUE(waitFor([&data]() { return data.done; }, MaxWaitMsec));
+
+    EXPECT_TRUE(data.error);
+    EXPECT_FALSE(tor->has_block(block));
+    EXPECT_EQ(had_total, tor->has_total());
     EXPECT_TRUE(tor->error().is_local_error());
 
     tr_torrentRemove(tor, true);

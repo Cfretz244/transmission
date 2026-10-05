@@ -2059,20 +2059,27 @@ tr_error_code_t tr_peerMsgsImpl::client_got_block(
 
     logtrace(this, fmt::format("got block {:d}", block));
 
-    auto event = tr_peer_event::GotBlock(tor_.block_info(), block);
     active_requests.unset(block);
 
+    // The write finishes later on the session thread. By then this peer may
+    // have disconnected and the torrent may have been stopped or freed, so
+    // look both up again rather than capturing `this`.
     session->local_data.write(
         tor_.make_io_plan(tor_.block_info().byte_span_for_block(block)),
         std::move(block_data),
-        [session = session, msgs = this, event](
+        [session = session, weak = weak_from_this(), block](
             tr_torrent_id_t tor_id,
             tr_byte_span_t /*byte_span*/,
             tr_error const& error,
             bool created_file)
         {
             tr_torrent::on_local_write_done(*session, tor_id, error, created_file);
-            session->run_in_session_thread([msgs, event]() { msgs->publish(event); });
+
+            if (auto* const tor = session->torrents().get(tor_id); tor != nullptr)
+            {
+                auto const self = weak.lock();
+                tr_peerMgrBlockWritten(tor, self.get(), block, error);
+            }
         });
 
     return 0;
