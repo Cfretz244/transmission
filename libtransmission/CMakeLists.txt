@@ -80,7 +80,6 @@ target_sources(${TR_NAME}
         ip-cache.h
         log.cc
         log.h
-        lru-cache.h
         magnet-metainfo.cc
         magnet-metainfo.h
         makemeta.cc
