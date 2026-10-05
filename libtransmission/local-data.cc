@@ -389,7 +389,9 @@ public:
     void close_all()
     {
         auto lock = std::unique_lock(mutex_);
-        idle_cv_.wait(lock, [this]() { return std::empty(queues_) && std::empty(active_ids_); });
+        // After shutdown() the workers are joined: nothing is queued or
+        // active any more, and nothing is left to signal idle_cv_.
+        idle_cv_.wait(lock, [this]() { return stopping_workers_ || (std::empty(queues_) && std::empty(active_ids_)); });
         backend_->close_all();
     }
 
@@ -551,8 +553,9 @@ public:
 
             shutting_down_ = true;
 
-            for (auto& [id, queue] : queues_)
+            for (auto queue_it = std::begin(queues_); queue_it != std::end(queues_);)
             {
+                auto& queue = queue_it->second;
                 auto it = std::begin(queue);
                 while (it != std::end(queue))
                 {
@@ -565,6 +568,10 @@ public:
                     discard_unlocked(*it, canceled);
                     it = queue.erase(it);
                 }
+
+                // An emptied queue must not linger: close_all() waits for
+                // `queues_` to be empty, and no worker will erase it later.
+                queue_it = std::empty(queue) ? queues_.erase(queue_it) : std::next(queue_it);
             }
 
             drained_cv_.wait(lock, [this]() { return pending_non_read_ == 0U && active_non_read_ == 0U; });
@@ -629,6 +636,10 @@ private:
         if (!is_cancelled_at_shutdown(task.op))
         {
             --pending_non_read_;
+            if (shutting_down_ && pending_non_read_ == 0U && active_non_read_ == 0U)
+            {
+                drained_cv_.notify_all();
+            }
         }
 
         if (task.cancel)

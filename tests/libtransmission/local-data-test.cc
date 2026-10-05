@@ -771,3 +771,87 @@ TEST(LocalData, ShutdownDrainsWritesAndCancelsReads)
     // the read never reached the backend
     EXPECT_EQ((std::vector<std::string>{ "1:write" }), raw_backend->log());
 }
+
+// shutdown() cancels queued reads, which can leave a torrent with an empty
+// queue. close_all() waits for every queue to go away, so an emptied queue
+// that lingered would make it hang forever: no worker is left to erase it.
+TEST(LocalData, CloseAllReturnsAfterShutdownCancelledAQueuedRead)
+{
+    auto backend = std::make_unique<StubBackend>();
+    auto* raw_backend = backend.get();
+    backend->hold(1);
+    auto local_data = tr::LocalData{ std::move(backend), {}, 1U };
+
+    // the first read is blocked in the backend; the second waits in the queue
+    local_data.read(make_plan(1, { .begin = 0U, .end = 3U }), [](auto, auto, auto&, auto) {});
+    ASSERT_TRUE(raw_backend->wait_until_running(1));
+    auto read_result = std::promise<tr_error_code_t>{};
+    auto read_future = read_result.get_future();
+    local_data.read(
+        make_plan(1, { .begin = 3U, .end = 6U }),
+        [&](auto, auto, tr_error const& error, auto) { read_result.set_value(error.code()); });
+
+    // shutdown joins the workers, so the active read must be let go
+    auto releaser = std::thread(
+        [raw_backend]()
+        {
+            std::this_thread::sleep_for(100ms);
+            raw_backend->release(1);
+        });
+    local_data.shutdown();
+    releaser.join();
+
+    ASSERT_TRUE(wait_for(read_future));
+    EXPECT_EQ(ECANCELED, read_future.get());
+
+    // must return at once: the queue of torrent 1 is gone and the workers are joined
+    local_data.close_all();
+    EXPECT_TRUE(raw_backend->close_all_called);
+    EXPECT_EQ((std::vector<std::string>{ "1:read" }), raw_backend->log());
+}
+
+// shutdown() waits for the queued writes to drain. forget() discards them,
+// so it must wake shutdown() up: here the only running task is a read,
+// which does not count as drained work and so never signals on its own.
+TEST(LocalData, ForgetWakesShutdownWaitingOnAQueuedWrite)
+{
+    auto backend = std::make_unique<StubBackend>();
+    auto* raw_backend = backend.get();
+    backend->hold(1);
+    auto local_data = tr::LocalData{ std::move(backend), {}, 1U };
+
+    // the read is blocked in the backend; the write waits in the queue behind it
+    local_data.read(make_plan(1, { .begin = 0U, .end = 3U }), [](auto, auto, auto&, auto) {});
+    ASSERT_TRUE(raw_backend->wait_until_running(1));
+    auto write_result = std::promise<tr_error_code_t>{};
+    auto write_future = write_result.get_future();
+    auto data = std::make_unique<tr::LocalData::BlockData>();
+    data->assign({ uint8_t{ 1U } });
+    local_data.write(
+        make_plan(1, { .begin = 0U, .end = 1U }),
+        std::move(data),
+        [&](auto, auto, tr_error const& error, auto) { write_result.set_value(error.code()); });
+
+    auto shutdown_done = std::promise<void>{};
+    auto shutdown_future = shutdown_done.get_future();
+    auto shutdowner = std::thread(
+        [&]()
+        {
+            local_data.shutdown();
+            shutdown_done.set_value();
+        });
+
+    // let shutdown() reach its wait, then take away the write it is waiting for
+    std::this_thread::sleep_for(100ms);
+    EXPECT_EQ(std::future_status::timeout, shutdown_future.wait_for(50ms));
+    local_data.forget(1);
+    ASSERT_TRUE(wait_for(write_future));
+    EXPECT_EQ(ECANCELED, write_future.get());
+
+    // shutdown() now only has to join the worker, which is still in the held read
+    raw_backend->release(1);
+    ASSERT_TRUE(wait_for(shutdown_future));
+    shutdowner.join();
+
+    EXPECT_EQ((std::vector<std::string>{ "1:read" }), raw_backend->log());
+}
