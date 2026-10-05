@@ -1205,6 +1205,15 @@ void tr_announcerAddBytes(tr_torrent* tor, int type, uint32_t n_bytes)
     }
 }
 
+uint64_t tr_announcerGetBytes(tr_torrent const* tor, int type)
+{
+    TR_ASSERT(tr_isTorrent(tor));
+    TR_ASSERT(type == TR_ANN_UP || type == TR_ANN_DOWN || type == TR_ANN_CORRUPT);
+
+    auto const& tiers = tor->torrent_announcer->tiers;
+    return std::empty(tiers) ? 0U : std::begin(tiers)->byteCounts[type];
+}
+
 // ---
 
 void tr_announcer_impl::removeTorrent(tr_torrent* tor)

@@ -736,7 +736,11 @@ public:
 
 
     // See tr_peerMgrBlockWritten()
-    void on_block_written(tr_peer* const peer, tr_block_index_t const block, tr_error const& error)
+    void on_block_written(
+        tr_peer* const peer,
+        tr_block_source const source,
+        tr_block_index_t const block,
+        tr_error const& error)
     {
         auto const lock = unique_lock();
 
@@ -750,10 +754,20 @@ public:
 
         cancel_all_requests_for_block(block, peer);
 
+        auto const piece = tor->block_loc(block).piece;
+
         if (peer != nullptr)
         {
             peer->blocks_sent_to_client.add(tr_time(), 1);
-            peer->blame.set(tor->block_loc(block).piece);
+            peer->blame.set(piece);
+        }
+
+        // Recorded here, not looked up in the sender's blame when the piece
+        // completes: the sender may have disconnected by then, and the
+        // tracker would be told less `downloaded` than the truth.
+        if (source == tr_block_source::Peer)
+        {
+            pieces_from_peers_.set(piece);
         }
 
         got_block(tor, block); // put this line before calling tr_torrent callback
@@ -779,6 +793,11 @@ public:
     tr_peerMgr* const manager;
 
     tr_torrent* const tor;
+
+    // Pieces with at least one block that came from a BitTorrent peer
+    // (not a webseed), set as blocks land and cleared when the piece
+    // completes or fails its check. Session thread only.
+    tr_bitfield pieces_from_peers_{ tor->piece_count() };
 
     std::vector<std::unique_ptr<tr_webseed>> webseeds;
 
@@ -887,27 +906,23 @@ private:
 
     void on_piece_completed(tr_piece_index_t piece)
     {
-        bool piece_came_from_peers = false;
-
         for (auto const& peer : peers)
         {
             // notify the peer that we now have this piece
             peer->on_piece_completed(piece);
-
-            if (!piece_came_from_peers)
-            {
-                piece_came_from_peers = peer->blame.test(piece);
-            }
         }
 
-        if (piece_came_from_peers) /* webseed downloads don't belong in announce totals */
+        if (pieces_from_peers_.test(piece)) /* webseed downloads don't belong in announce totals */
         {
+            pieces_from_peers_.unset(piece);
             tr_announcerAddBytes(tor, TR_ANN_DOWN, tor->piece_size(piece));
         }
     }
 
     void on_got_bad_piece(tr_piece_index_t piece)
     {
+        pieces_from_peers_.unset(piece); // whoever re-sends it gets the credit
+
         auto const maybe_add_strike = [this, piece](tr_peer* const peer)
         {
             if (peer->blame.test(piece))
@@ -940,6 +955,8 @@ private:
 
     void on_got_metainfo()
     {
+        pieces_from_peers_ = tr_bitfield{ tor->piece_count() };
+
         // the webseed list may have changed...
         rebuild_webseeds();
 
@@ -991,14 +1008,6 @@ private:
                 auto* const tor = s->tor;
                 auto const loc = tor->piece_loc(event.pieceIndex, event.offset);
                 s->got_reject(tor, peer, loc.block);
-            }
-            break;
-
-        case tr_peer_event::Type::ClientGotBlock:
-            {
-                auto* const tor = s->tor;
-                auto const loc = tor->piece_loc(event.pieceIndex, event.offset);
-                tr_peerMgrBlockWritten(tor, peer, loc.block, {});
             }
             break;
 
@@ -1892,14 +1901,19 @@ void tr_swarm::on_torrent_stopped()
     stop();
 }
 
-void tr_peerMgrBlockWritten(tr_torrent* const tor, tr_peer* const peer, tr_block_index_t const block, tr_error const& error)
+void tr_peerMgrBlockWritten(
+    tr_torrent* const tor,
+    tr_peer* const peer,
+    tr_block_source const source,
+    tr_block_index_t const block,
+    tr_error const& error)
 {
     TR_ASSERT(tr_isTorrent(tor));
     TR_ASSERT(tor->session->am_in_session_thread());
 
     if (auto* const s = tor->swarm; s != nullptr)
     {
-        s->on_block_written(peer, block, error);
+        s->on_block_written(peer, source, block, error);
     }
 }
 

@@ -18,6 +18,7 @@
 #include <libtransmission/peer-common.h>
 #include <libtransmission/transmission.h>
 
+#include <libtransmission/announcer.h>
 #include <libtransmission/block-info.h>
 #include <libtransmission/file.h> // tr_sys_path_*()
 #include <libtransmission/local-data.h>
@@ -94,15 +95,14 @@ TEST_P(IncompleteDirTest, incompleteDir)
 
     auto const test_incomplete_dir_threadfunc = [](TestIncompleteDirData* data) noexcept
     {
-        auto const event = tr_peer_event::GotBlock(data->tor->block_info(), data->block);
         data->session->local_data.write(
             data->tor->make_io_plan(data->tor->block_info().byte_span_for_block(data->block)),
             std::move(data->buf),
-            [data, event](tr_torrent_id_t tor_id, tr_byte_span_t, tr_error const& error, bool created_file)
+            [data](tr_torrent_id_t tor_id, tr_byte_span_t, tr_error const& error, bool created_file)
             {
                 tr_torrent::on_local_write_done(*data->session, tor_id, error, created_file);
                 data->session->run_in_session_thread(
-                    [data, event, error]()
+                    [data, error]()
                     {
                         if (!error)
                         {
@@ -343,6 +343,7 @@ protected:
         tr_torrent* tor = {};
         tr_block_index_t block = {};
         std::unique_ptr<tr::LocalData::BlockData> buf;
+        tr_block_source source = tr_block_source::Peer;
         std::string bad_dir; // if set, the write is planned into this unusable directory
         tr_error error;
         bool done = {};
@@ -368,13 +369,65 @@ protected:
                 tr_torrent::on_local_write_done(*data->session, tor_id, error, created_file);
                 if (auto* const tor = data->session->torrents().get(tor_id); tor != nullptr)
                 {
-                    tr_peerMgrBlockWritten(tor, nullptr, data->block, error);
+                    tr_peerMgrBlockWritten(tor, nullptr, data->source, data->block, error);
                 }
                 data->error = error;
                 data->done = true;
             });
     }
+
+    // Writes every block of `piece`, zero-filled, from senders of kind
+    // `source` that have all departed, and waits for the piece's hash check.
+    void write_piece_from_departed_senders(tr_torrent* tor, tr_piece_index_t piece, tr_block_source source)
+    {
+        auto const [begin, end] = tor->block_span_for_piece(piece);
+        for (auto block = begin; block < end; ++block)
+        {
+            auto data = WriteData{};
+            data.session = session_;
+            data.tor = tor;
+            data.block = block;
+            data.buf = std::make_unique<tr::LocalData::BlockData>(tr_block_info::BlockSize);
+            std::fill_n(std::data(*data.buf), tr_block_info::BlockSize, '\0');
+            data.source = source;
+            session_->run_in_session_thread(write_from_departed_peer, &data);
+            EXPECT_TRUE(waitFor([&data]() { return data.done; }, MaxWaitMsec));
+            EXPECT_FALSE(data.error) << data.error;
+        }
+
+        EXPECT_TRUE(waitFor([tor]() { return !tor->has_pending_piece_tests(); }, MaxWaitMsec));
+    }
 };
+
+// A completed piece is credited to the tracker as `downloaded` if peers
+// sent it. That used to be decided by reading the senders' blame when the
+// hash check answered, so a peer that disconnected in between cost the
+// credit and the tracker was told less than the truth.
+TEST_F(BlockWrittenTest, downloadedIsCreditedWithoutTheSender)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Partial);
+    ASSERT_EQ(0U, tr_announcerGetBytes(tor, TR_ANN_DOWN));
+
+    write_piece_from_departed_senders(tor, 0U, tr_block_source::Peer);
+
+    EXPECT_TRUE(tor->has_piece(0U));
+    EXPECT_EQ(tor->piece_size(0U), tr_announcerGetBytes(tor, TR_ANN_DOWN));
+
+    tr_torrentRemove(tor, true);
+}
+
+// Webseed downloads don't belong in announce totals.
+TEST_F(BlockWrittenTest, webseedBlocksAreNotCreditedAsDownloaded)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Partial);
+
+    write_piece_from_departed_senders(tor, 0U, tr_block_source::Webseed);
+
+    EXPECT_TRUE(tor->has_piece(0U));
+    EXPECT_EQ(0U, tr_announcerGetBytes(tor, TR_ANN_DOWN));
+
+    tr_torrentRemove(tor, true);
+}
 
 // A peer can disconnect while its block is still queued for writing.
 // The block is the torrent's, not the peer's: it must still be recorded.

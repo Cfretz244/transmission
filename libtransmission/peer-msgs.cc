@@ -2064,7 +2064,7 @@ tr_error_code_t tr_peerMsgsImpl::client_got_block(
             if (auto* const tor = session->torrents().get(tor_id); tor != nullptr)
             {
                 auto const self = weak.lock();
-                tr_peerMgrBlockWritten(tor, self.get(), block, error);
+                tr_peerMgrBlockWritten(tor, self.get(), tr_block_source::Peer, block, error);
             }
         });
 

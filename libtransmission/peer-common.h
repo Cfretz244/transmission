@@ -47,7 +47,6 @@ public:
     enum class Type : uint8_t
     {
         // Unless otherwise specified, all events are for BT peers only
-        ClientGotBlock, // applies to webseed too
         ClientGotChoke,
         ClientGotPieceData, // applies to webseed too
         ClientGotAllowedFast,
@@ -67,18 +66,11 @@ public:
     Type type = Type::Error;
 
     tr_bitfield* bitfield = nullptr; // for GotBitfield
-    uint32_t pieceIndex = 0; // for GotBlock, GotHave, Cancel, Allowed, Suggest
-    uint32_t offset = 0; // for GotBlock
-    uint32_t length = 0; // for GotBlock, GotPieceData
+    uint32_t pieceIndex = 0; // for GotHave, Cancel, Allowed, Suggest, GotRej, SentRequest
+    uint32_t offset = 0; // for Cancel, GotRej, SentRequest
+    uint32_t length = 0; // for GotPieceData, Cancel, GotRej, SentRequest
     int err = 0; // errno for GotError
     tr_port port; // for GotPort
-
-    [[nodiscard]] constexpr static auto GotBlock(tr_block_info const& block_info, tr_block_index_t block) noexcept
-    {
-        auto event = BlockEvent(block_info, block);
-        event.type = Type::ClientGotBlock;
-        return event;
-    }
 
     [[nodiscard]] constexpr static auto GotAllowedFast(tr_piece_index_t piece) noexcept
     {

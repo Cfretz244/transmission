@@ -100,6 +100,10 @@ enum : uint8_t
 
 void tr_announcerAddBytes(tr_torrent* tor, int type, uint32_t n_bytes);
 
+// Bytes of `type` credited to `tor` since its last announce that reset them.
+// Every tier is credited alike; this reads the first one, or 0 with no trackers.
+[[nodiscard]] uint64_t tr_announcerGetBytes(tr_torrent const* tor, int type);
+
 time_t tr_announcerNextManualAnnounce(tr_torrent const* tor);
 
 tr_tracker_view tr_announcerTracker(tr_torrent const* torrent, size_t nth);

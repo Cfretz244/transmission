@@ -430,7 +430,12 @@ void tr_webseed_task::use_fetched_blocks()
 
                         if (auto* const tor = session->torrents().get(id); tor != nullptr)
                         {
-                            tr_peerMgrBlockWritten(tor, alive.expired() ? nullptr : webseed, block, error);
+                            tr_peerMgrBlockWritten(
+                                tor,
+                                alive.expired() ? nullptr : webseed,
+                                tr_block_source::Webseed,
+                                block,
+                                error);
                         }
                     };
                     session->local_data.write(
