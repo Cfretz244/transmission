@@ -1485,6 +1485,11 @@ private:
 
     bool needs_completeness_check_ = true;
 
+    // The download finished while the torrent was stopped (its last hash
+    // check answered after the stop), so `completed` is owed to the
+    // trackers at the next start.
+    bool announce_completed_on_start_ = false;
+
     // Piece hash checks enqueued to LocalData and not yet answered.
     // Both counters are touched only on the session thread.
     size_t n_pending_piece_tests_ = 0;

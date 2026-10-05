@@ -686,6 +686,11 @@ void tr_torrent::start_in_session_thread()
     set_dirty();
 
     session->announcer_->startTorrent(this);
+    if (announce_completed_on_start_)
+    {
+        announce_completed_on_start_ = false;
+        tr_announcerTorrentCompleted(this);
+    }
     lpdAnnounceAt = now;
     started_(this);
 }
@@ -1978,7 +1983,19 @@ void tr_torrent::recheck_completeness()
                 // https://www.bittorrent.org/beps/bep_0003.html
                 // ...and one using completed is sent when the download is complete.
                 // No completed is sent if the file was complete when started.
-                tr_announcerTorrentCompleted(this);
+                //
+                // The last piece's hash check answers asynchronously, so
+                // this can run after the torrent was stopped and `stopped`
+                // already announced. Don't queue `completed` behind that:
+                // send it when the torrent next starts, after `started`.
+                if (is_running())
+                {
+                    tr_announcerTorrentCompleted(this);
+                }
+                else
+                {
+                    announce_completed_on_start_ = true;
+                }
             }
             date_done_ = tr_time();
 
