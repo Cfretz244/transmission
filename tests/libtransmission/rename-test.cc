@@ -8,18 +8,29 @@
 #include <cstddef> // size_t
 #include <cstdint> // uint32_t, uint64_t
 #include <string>
+#include <memory>
 #include <string_view>
 #include <vector>
+
+#ifndef _WIN32
+#include <fcntl.h> // open()
+#include <sys/stat.h> // mkfifo()
+#include <unistd.h> // close()
+#endif
 
 #include <gtest/gtest.h>
 
 #include <libtransmission/transmission.h>
 
+#include <libtransmission/block-info.h>
 #include <libtransmission/crypto-utils.h>
 #include <libtransmission/error.h>
 #include <libtransmission/file-utils.h>
 #include <libtransmission/file.h>
+#include <libtransmission/local-data.h>
 #include <libtransmission/resume.h>
+#include <libtransmission/session.h>
+#include <libtransmission/string-utils.h> // tr_strerror()
 #include <libtransmission/torrent.h> // tr_isTorrent()
 #include <libtransmission/tr-strbuf.h>
 
@@ -494,6 +505,85 @@ TEST_F(RenameTest, partialFile)
     }
 
     torrentRemoveAndWait(tor, 0);
+}
+
+// A rename queued while LocalData still holds writes under the old name
+// must run after them: renaming on disk first lets a queued write recreate
+// the old file, and the torrent then looks for its data under the new name.
+TEST_F(RenameTest, renameRunsAfterQueuedWrites)
+{
+#ifdef _WIN32
+    GTEST_SKIP() << "stalls the torrent's disk queue with a FIFO";
+#else
+    static auto constexpr Wait = 3000;
+
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::NoFiles);
+    auto const download_dir = std::string{ tr_sessionGetDownloadDir(session_) };
+    auto const old_name = std::string{ tr_torrentName(tor) };
+    // the session names incomplete files `*.part`
+    auto const old_file = tr_pathbuf{ download_dir, '/', old_name, "/1048576.part"sv };
+    auto const new_file = tr_pathbuf{ download_dir, "/renamed/1048576.part"sv };
+
+    // Stall the torrent's disk queue, which runs one op at a time: a read
+    // whose "file" is a FIFO with no writer blocks in open() until the test
+    // opens the other end. See RemoveTorrentTest.
+    auto const fifo_name = "stall.fifo"sv;
+    auto const fifo_path = tr_pathbuf{ download_dir, '/', fifo_name };
+    ASSERT_EQ(0, mkfifo(fifo_path.c_str(), 0600)) << tr_strerror(errno);
+    auto stall_plan = tor->make_io_plan(tor->block_info().byte_span_for_block(0U));
+    ASSERT_EQ(1U, std::size(stall_plan.files));
+    stall_plan.files[0].index = tor->file_count() + 1U;
+    stall_plan.files[0].subpath = fifo_name;
+    auto stall_answered = false;
+    session_->local_data.read(
+        std::move(stall_plan),
+        [&stall_answered](tr_torrent_id_t, tr_byte_span_t, tr_error const&, std::unique_ptr<tr::LocalData::BlockData>)
+        { stall_answered = true; });
+
+    // queue a write of block 0, planned under the old name
+    auto written = false;
+    auto buf = std::make_unique<tr::LocalData::BlockData>(tr_block_info::BlockSize);
+    std::fill_n(std::data(*buf), tr_block_info::BlockSize, '\0');
+    session_->local_data.write(
+        tor->make_io_plan(tor->block_info().byte_span_for_block(0U)),
+        std::move(buf),
+        [&written](tr_torrent_id_t, tr_byte_span_t, tr_error const& error, bool)
+        {
+            EXPECT_FALSE(error) << error;
+            written = true;
+        });
+
+    // rename the top-level directory while that write is still queued
+    auto rename_error = -1;
+    tr_torrentRenamePath(
+        tor,
+        old_name,
+        "renamed",
+        [&rename_error](tr_torrent_id_t, std::string_view, std::string_view, tr_error const& error) noexcept
+        { rename_error = error ? error.code() : 0; });
+
+    // the torrent uses the new name right away...
+    EXPECT_TRUE(waitFor([tor]() { return tr_torrentName(tor) == "renamed"sv; }, Wait));
+    EXPECT_STREQ("renamed/1048576", tr_torrentFile(tor, 0).name);
+    // ...but nothing has reached the disk
+    EXPECT_FALSE(written);
+    EXPECT_FALSE(stall_answered);
+    EXPECT_FALSE(tr_sys_path_exists(old_file));
+    EXPECT_FALSE(tr_sys_path_exists(new_file));
+
+    // release the stall: the write lands under the old name, then the rename moves it
+    auto const writer = open(fifo_path.c_str(), O_WRONLY);
+    ASSERT_NE(-1, writer) << tr_strerror(errno);
+    EXPECT_EQ(0, close(writer));
+    EXPECT_TRUE(waitFor([&written, &rename_error]() { return written && rename_error != -1; }, Wait));
+    EXPECT_EQ(0, rename_error);
+    EXPECT_TRUE(stall_answered);
+    EXPECT_TRUE(tr_sys_path_exists(new_file));
+    EXPECT_FALSE(tr_sys_path_exists(old_file));
+    EXPECT_EQ(new_file, tr_torrentFindFile(tor, 0));
+
+    torrentRemoveAndWait(tor, 0);
+#endif
 }
 
 } // namespace tr::test

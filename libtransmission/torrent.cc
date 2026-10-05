@@ -2847,51 +2847,97 @@ void tr_torrent::rename_path_in_session_thread(
 {
     using namespace rename_helpers;
 
-    tr_error_code_t error = 0;
+    auto const finish = [this, &callback](std::string_view const old, std::string_view const name, tr_error_code_t const code)
+    {
+        mark_changed();
+
+        if (callback != nullptr)
+        {
+            auto rename_error = tr_error{};
+            if (code != 0)
+            {
+                rename_error.set_from_errno(code);
+            }
+
+            callback(id(), old, name, rename_error);
+        }
+    };
 
     if (!renameArgsAreValid(this, oldpath, newname))
     {
-        error = EINVAL;
+        finish(oldpath, newname, EINVAL);
+        return;
     }
-    else if (auto const file_indices = renameFindAffectedFiles(this, oldpath); std::empty(file_indices))
-    {
-        error = EINVAL;
-    }
-    else
-    {
-        error = renamePath(this, oldpath, newname);
 
-        if (error == 0)
+    auto const file_indices = renameFindAffectedFiles(this, oldpath);
+    if (std::empty(file_indices))
+    {
+        finish(oldpath, newname, EINVAL);
+        return;
+    }
+
+    auto const base = is_done() || std::empty(incomplete_dir()) ? download_dir() : incomplete_dir();
+
+    // Rename the torrent's file strings now, so that I/O planned from here
+    // on uses the new names. LocalData runs the torrent's tasks in order,
+    // so writes already queued under the old names land before the on-disk
+    // rename below moves them; the callback undoes the strings if it fails.
+    for (auto const& file_index : file_indices)
+    {
+        renameTorrentFileString(this, oldpath, newname, file_index);
+    }
+
+    auto const renamed_top = std::size(file_indices) == file_count() && !tr_strv_contains(oldpath, '/');
+    if (renamed_top)
+    {
+        set_name(newname);
+    }
+
+    mark_edited();
+    set_dirty();
+
+    session->local_data.rename(
+        id(),
+        base.sv(),
+        oldpath,
+        newname,
+        [session = this->session,
+         file_indices,
+         renamed_top,
+         callback](tr_torrent_id_t const tor_id, std::string_view const old, std::string_view const name, tr_error const& error)
         {
-            /* update tr_info.files */
-            for (auto const& file_index : file_indices)
+            auto const lock = session->unique_lock();
+
+            if (auto* const tor = session->torrents().get(tor_id); tor != nullptr)
             {
-                renameTorrentFileString(this, oldpath, newname, file_index);
+                if (error)
+                {
+                    // put the strings back: the new path is `dirname(old)/name`
+                    auto const newpath = tr_strv_contains(old, '/') ? tr_pathbuf{ tr_sys_path_dirname(old), '/', name } :
+                                                                      tr_pathbuf{ name };
+                    auto const oldname = tr_sys_path_basename(old);
+                    for (auto const& file_index : file_indices)
+                    {
+                        renameTorrentFileString(tor, newpath, oldname, file_index);
+                    }
+
+                    if (renamed_top)
+                    {
+                        tor->set_name(oldname);
+                    }
+
+                    tor->mark_edited();
+                    tor->set_dirty();
+                }
+
+                tor->mark_changed();
             }
 
-            /* update tr_info.name if user changed the toplevel */
-            if (std::size(file_indices) == file_count() && !tr_strv_contains(oldpath, '/'))
+            if (callback != nullptr)
             {
-                set_name(newname);
+                callback(tor_id, old, name, error);
             }
-
-            mark_edited();
-            set_dirty();
-        }
-    }
-
-    mark_changed();
-
-    if (callback != nullptr)
-    {
-        auto rename_error = tr_error{};
-        if (error != 0)
-        {
-            rename_error.set_from_errno(error);
-        }
-
-        callback(id(), oldpath, newname, rename_error);
-    }
+        });
 }
 
 void tr_torrent::rename_path(std::string_view oldpath, std::string_view newname, tr_torrent_rename_done_func&& callback)
