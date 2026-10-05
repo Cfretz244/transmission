@@ -145,6 +145,7 @@ public:
 
     // Bytes in queued writes that have not reached the backend yet.
     [[nodiscard]] uint64_t enqueued_write_bytes() const;
+    [[nodiscard]] uint64_t enqueued_write_bytes(tr_torrent_id_t id) const;
 
 private:
     class Impl;

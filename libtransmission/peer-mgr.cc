@@ -36,6 +36,7 @@
 #include "libtransmission/crypto-utils.h"
 #include "libtransmission/handshake.h"
 #include "libtransmission/interned-string.h"
+#include "libtransmission/local-data.h"
 #include "libtransmission/log.h"
 #include "libtransmission/net.h"
 #include "libtransmission/peer-common.h"
@@ -66,6 +67,11 @@ static auto constexpr CancelHistorySec = 60;
 
 namespace
 {
+// Upper bound on a torrent's unwritten, queued block bytes before block
+// requests pause. 4 MiB is a few seconds of writes on a slow network mount
+// and well under a second on a local disk.
+auto constexpr MaxQueuedWriteBytesPerTorrent = uint64_t{ 4U * 1024U * 1024U };
+
 
 class HandshakeMediator final : public tr_handshake::Mediator
 {
@@ -1234,6 +1240,16 @@ void tr_peerMgrFree(tr_peerMgr* manager)
 std::vector<tr_block_span_t> tr_peerMgrGetNextRequests(tr_torrent* torrent, tr_peer const* peer, size_t numwant)
 {
     TR_ASSERT(!torrent->is_done());
+
+    // Blocks are written to disk asynchronously. When the disk falls behind
+    // the network, stop asking for more until the backlog drains; peers and
+    // webseeds retry from their timers. This bounds the memory held by
+    // unwritten blocks and keeps piece verification from queueing behind
+    // an unbounded run of writes.
+    if (torrent->session->local_data.enqueued_write_bytes(torrent->id()) >= MaxQueuedWriteBytesPerTorrent)
+    {
+        return {};
+    }
 
     if (auto& controller = torrent->swarm->wishlist_controller)
     {

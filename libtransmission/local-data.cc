@@ -631,7 +631,27 @@ public:
         return enqueued_write_bytes_;
     }
 
+    [[nodiscard]] uint64_t enqueued_write_bytes(tr_torrent_id_t const id) const
+    {
+        auto const lock = std::lock_guard(mutex_);
+        auto const it = enqueued_write_bytes_by_id_.find(id);
+        return it != std::end(enqueued_write_bytes_by_id_) ? it->second : 0U;
+    }
+
 private:
+    void release_write_bytes_unlocked(tr_torrent_id_t const id, uint64_t const n_bytes)
+    {
+        enqueued_write_bytes_ -= n_bytes;
+        if (auto it = enqueued_write_bytes_by_id_.find(id); it != std::end(enqueued_write_bytes_by_id_))
+        {
+            it->second -= n_bytes;
+            if (it->second == 0U)
+            {
+                enqueued_write_bytes_by_id_.erase(it);
+            }
+        }
+    }
+
     void dispatch(std::function<void()> func)
     {
         dispatcher_(std::move(func));
@@ -643,7 +663,7 @@ private:
     {
         if (task.op == Op::Write)
         {
-            enqueued_write_bytes_ -= task.write_bytes;
+            release_write_bytes_unlocked(task.id, task.write_bytes);
         }
 
         if (!is_read_like(task.op))
@@ -673,6 +693,7 @@ private:
                 if (task.op == Op::Write)
                 {
                     enqueued_write_bytes_ += task.write_bytes;
+                    enqueued_write_bytes_by_id_[task.id] += task.write_bytes;
                 }
 
                 if (!is_read_like(task.op))
@@ -778,7 +799,7 @@ private:
 
                 if (task.op == Op::Write)
                 {
-                    enqueued_write_bytes_ -= task.write_bytes;
+                    release_write_bytes_unlocked(task.id, task.write_bytes);
                 }
 
                 if (!is_read_like(task.op))
@@ -824,6 +845,7 @@ private:
     std::vector<std::thread> workers_;
 
     uint64_t enqueued_write_bytes_ = 0;
+    std::unordered_map<tr_torrent_id_t, uint64_t> enqueued_write_bytes_by_id_;
     size_t pending_non_read_ = 0;
     size_t active_non_read_ = 0;
 
@@ -911,6 +933,11 @@ void LocalData::shutdown()
 uint64_t LocalData::enqueued_write_bytes() const
 {
     return impl_->enqueued_write_bytes();
+}
+
+uint64_t LocalData::enqueued_write_bytes(tr_torrent_id_t const id) const
+{
+    return impl_->enqueued_write_bytes(id);
 }
 
 } // namespace tr

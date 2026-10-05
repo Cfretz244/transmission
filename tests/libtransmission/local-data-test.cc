@@ -340,11 +340,14 @@ TEST(LocalData, WriteDeliversDataAndAccountsBytes)
     // the write is queued or blocked in the backend, so its bytes are still pending
     ASSERT_TRUE(raw_backend->wait_until_running(11));
     EXPECT_EQ(3U, local_data.enqueued_write_bytes());
+    EXPECT_EQ(3U, local_data.enqueued_write_bytes(11));
+    EXPECT_EQ(0U, local_data.enqueued_write_bytes(12));
 
     raw_backend->release(11);
     ASSERT_TRUE(wait_for(done_future));
     local_data.close_all(); // waits for the worker to finish bookkeeping
     EXPECT_EQ(0U, local_data.enqueued_write_bytes());
+    EXPECT_EQ(0U, local_data.enqueued_write_bytes(11));
 }
 
 TEST(LocalData, InvalidWriteFailsWithoutTouchingBackend)
