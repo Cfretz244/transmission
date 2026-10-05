@@ -126,6 +126,10 @@ public:
 
     virtual void on_piece_completed(tr_piece_index_t) = 0;
 
+    // Upload reads issued to LocalData for this peer's requests and not
+    // yet sent: the per-peer read lookahead. For diagnostics and tests.
+    [[nodiscard]] virtual size_t upload_reads_outstanding() const noexcept = 0;
+
     [[nodiscard]] virtual bool can_ut_holepunch() const noexcept = 0;
     virtual void send_ut_holepunch(
         bep55::MsgType msg_type,

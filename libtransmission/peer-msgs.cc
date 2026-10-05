@@ -188,6 +188,15 @@ auto constexpr MetadataReqQ = size_t{ 64U };
 
 auto constexpr PeerReqQDefault = 500U;
 
+// How many upload reads one peer may have outstanding: issued to LocalData
+// but not yet sent. A peer may queue up to `reqq` (2000 by default)
+// requests; reading them all when they arrive would hold 2000 x 16 KiB per
+// peer and push the torrent's own writes and piece checks to the back of
+// its LocalData queue, which runs one op at a time per torrent. A few
+// blocks of lookahead keeps the output buffer fed while the next read
+// completes; the rest stay queued as plain requests until there is room.
+auto constexpr MaxOutstandingUploadReads = size_t{ 16U };
+
 // when we're making requests from another peer,
 // batch them together to send enough requests to
 // meet our bandwidth goals for the next N seconds
@@ -583,15 +592,17 @@ private:
         peer_request req;
         uint64_t token = 0; // nonzero while a LocalData read is in flight
         bool awaiting_check = false; // true while tor_.request_piece_check() is in flight
-        std::shared_ptr<tr::LocalData::BlockData> data;
+        bool read_issued = false; // true once its LocalData read has been enqueued
+        std::shared_ptr<tr::LocalData::BlockData> data; // the block, once its read succeeded
 
-        // true if the request can't be answered yet: its block is still
-        // being read, or its piece is still being hashed. add_next_block()
-        // waits for the front of the queue rather than skipping it, so the
-        // peer gets its blocks in the order it asked for them.
+        // true if the request can't be answered yet: its piece is still
+        // being hashed, its read hasn't been issued, or its read is still
+        // in flight. add_next_block() waits for the front of the queue
+        // rather than skipping it, so the peer gets its blocks in the
+        // order it asked for them.
         [[nodiscard]] bool is_pending() const noexcept
         {
-            return token != 0 || awaiting_check;
+            return awaiting_check || !read_issued || token != 0;
         }
     };
 
@@ -661,20 +672,63 @@ private:
 
     void schedule_peer_request_read(peer_request const& req)
     {
-        if (tor_.is_piece_checked(req.index))
+        // A piece that hasn't been hashed since its file changed can't be
+        // served yet. Park the request until the torrent's (shared,
+        // deduplicated) check answers via piece_checked_; on_piece_checked()
+        // then releases or rejects it.
+        auto entry = queued_peer_request{};
+        entry.req = req;
+        entry.awaiting_check = !tor_.is_piece_checked(req.index);
+        if (entry.awaiting_check)
         {
-            auto const token = next_peer_request_token();
-            pending_peer_read_tokens_.insert(token);
-            peer_requested_.emplace_back(req, token, false, std::make_shared<tr::LocalData::BlockData>());
-            enqueue_local_data_read(req, token);
-            return;
+            tor_.request_piece_check(req.index);
         }
+        peer_requested_.push_back(std::move(entry));
 
-        // The piece hasn't been hashed since its file changed. Park the
-        // request until the torrent's (shared, deduplicated) check answers
-        // via piece_checked_; on_piece_checked() then reads or rejects it.
-        peer_requested_.emplace_back(req, 0U, true, std::make_shared<tr::LocalData::BlockData>());
-        tor_.request_piece_check(req.index);
+        pump_peer_request_reads();
+    }
+
+    void issue_local_data_read(queued_peer_request& entry)
+    {
+        auto const token = next_peer_request_token();
+        pending_peer_read_tokens_.insert(token);
+        entry.token = token;
+        entry.read_issued = true;
+        enqueue_local_data_read(entry.req, token);
+    }
+
+    // Issues reads for the front of the queue, in order, until
+    // MaxOutstandingUploadReads of them are outstanding. Reads are never
+    // issued past a request that is still awaiting its piece check: the
+    // blocks go out in queue order, so a read behind a parked request
+    // could not be sent anyway, and skipping would let the lookahead fill
+    // with blocks stuck behind the front of the queue.
+    void pump_peer_request_reads()
+    {
+        // One read per pass. Enqueueing can answer inline (a read refused
+        // at session close is cancelled on the spot), and that answer may
+        // pop the queue, so re-scan from the front after each issue.
+        for (;;)
+        {
+            auto n_outstanding = size_t{};
+            auto it = std::begin(peer_requested_);
+            for (; it != std::end(peer_requested_) && it->read_issued; ++it)
+            {
+                ++n_outstanding;
+            }
+
+            if (n_outstanding >= MaxOutstandingUploadReads || it == std::end(peer_requested_) || it->awaiting_check)
+            {
+                return;
+            }
+
+            issue_local_data_read(*it);
+        }
+    }
+
+    [[nodiscard]] size_t upload_reads_outstanding() const noexcept override
+    {
+        return static_cast<size_t>(std::ranges::count_if(peer_requested_, &queued_peer_request::read_issued));
     }
 
     void on_piece_checked(tr_piece_index_t const piece, bool const passed)
@@ -695,11 +749,7 @@ private:
 
             if (passed)
             {
-                auto const token = next_peer_request_token();
-                pending_peer_read_tokens_.insert(token);
                 it->awaiting_check = false;
-                it->token = token;
-                enqueue_local_data_read(it->req, token);
                 ++it;
                 continue;
             }
@@ -715,6 +765,7 @@ private:
         if (n_changed != 0U)
         {
             fill_output_buffer(tr_time(), tr_time_msec());
+            pump_peer_request_reads();
         }
     }
 
@@ -1817,6 +1868,7 @@ ReadResult tr_peerMsgsImpl::process_peer_message(uint8_t id, MessageReader& payl
                 }
 
                 requests.erase(iter);
+                pump_peer_request_reads();
 
                 // bep6: "Even when a request is cancelled, the peer
                 // receiving the cancel should respond with either the
@@ -2354,6 +2406,7 @@ void tr_peerMsgsImpl::check_request_timeout(time_t const now)
     auto const req = queued_req.req;
     auto data = std::move(peer_requested_.front().data);
     peer_requested_.pop_front();
+    pump_peer_request_reads();
 
     if (data != nullptr && std::size(*data) >= req.length)
     {
