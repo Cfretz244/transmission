@@ -153,8 +153,8 @@ public:
 
     // See tr_torrent_files::remove(). Runs after the torrent's in-flight
     // task, so no write can recreate a file after it is deleted.
-    // Discards the torrent's queued reads, tests, writes, moves and renames
-    // first; their callbacks get ECANCELED. `on_remove` may be empty.
+    // Discards the torrent's queued work first, as forget() does.
+    // `on_remove` may be empty.
     void remove(
         tr_torrent_id_t id,
         tr_torrent_files files,
@@ -170,6 +170,11 @@ public:
         std::string_view oldpath,
         std::string_view newname,
         tr_torrent_rename_done_func callback);
+
+    // Discards the torrent's queued reads, tests, writes, moves and renames;
+    // their callbacks get ECANCELED. Queued closes and removes still run.
+    // Call when the torrent is freed, so its files are not touched after it is gone.
+    void forget(tr_torrent_id_t id);
 
     // Stops accepting reads and tests, cancels the queued ones, and blocks
     // until every queued write, move, rename and remove has run.

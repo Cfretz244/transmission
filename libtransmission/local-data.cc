@@ -536,6 +536,30 @@ public:
         work_cv_.notify_one();
     }
 
+    void forget(tr_torrent_id_t const tor_id)
+    {
+        auto canceled = std::vector<std::function<void()>>{};
+
+        {
+            auto const lock = std::lock_guard(mutex_);
+            discard_queued_unlocked(tor_id, canceled);
+            if (auto const it = queues_.find(tor_id); it != std::end(queues_) && std::empty(it->second))
+            {
+                queues_.erase(it);
+            }
+
+            if (std::empty(queues_) && std::empty(active_ids_))
+            {
+                idle_cv_.notify_all();
+            }
+        }
+
+        for (auto& cancel : canceled)
+        {
+            cancel();
+        }
+    }
+
     void shutdown()
     {
         auto canceled = std::vector<std::function<void()>>{};
@@ -910,6 +934,11 @@ void LocalData::rename(
     tr_torrent_rename_done_func callback)
 {
     impl_->rename(id, base, oldpath, newname, std::move(callback));
+}
+
+void LocalData::forget(tr_torrent_id_t const id)
+{
+    impl_->forget(id);
 }
 
 void LocalData::shutdown()

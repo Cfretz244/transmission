@@ -623,6 +623,71 @@ TEST(LocalData, RemoveDiscardsQueuedWorkForThatTorrent)
     EXPECT_EQ((std::vector<std::string>{ "1:read", "1:close_torrent", "1:remove", "2:read" }), raw_backend->log());
 }
 
+TEST(LocalData, ForgetDiscardsQueuedWorkButKeepsRemove)
+{
+    auto backend = std::make_unique<StubBackend>();
+    auto* raw_backend = backend.get();
+    backend->hold(1);
+    auto local_data = tr::LocalData{ std::move(backend), {}, 1U };
+
+    auto first_read = std::promise<tr_error_code_t>{};
+    auto first_read_future = first_read.get_future();
+    local_data.read(
+        make_plan(1, { .begin = 0U, .end = 3U }),
+        [&](auto, auto, tr_error const& error, auto) { first_read.set_value(error.code()); });
+    ASSERT_TRUE(raw_backend->wait_until_running(1));
+
+    auto remove_result = std::promise<tr_error_code_t>{};
+    auto remove_future = remove_result.get_future();
+    local_data.remove(
+        1,
+        {},
+        "/parent",
+        "name",
+        {},
+        [&](auto, tr_error const& error) { remove_result.set_value(error.code()); });
+
+    auto write_result = std::promise<tr_error_code_t>{};
+    auto write_future = write_result.get_future();
+    auto data = std::make_unique<tr::LocalData::BlockData>();
+    data->assign({ uint8_t{ 1U } });
+    local_data.write(
+        make_plan(1, { .begin = 0U, .end = 1U }),
+        std::move(data),
+        [&](auto, auto, tr_error const& error, auto) { write_result.set_value(error.code()); });
+
+    auto move_result = std::promise<tr_error_code_t>{};
+    auto move_future = move_result.get_future();
+    local_data.move(1, {}, "/a", "/b", "n", [&](auto, tr_error const& error) { move_result.set_value(error.code()); });
+
+    auto test_result = std::promise<tr_error_code_t>{};
+    auto test_future = test_result.get_future();
+    local_data.test_piece(
+        make_plan(1, { .begin = 0U, .end = 3U }),
+        0U,
+        [&](auto, auto, tr_error const& error, auto) { test_result.set_value(error.code()); });
+
+    local_data.forget(1);
+
+    // the queued write, move and test were discarded, but the remove still runs
+    ASSERT_TRUE(wait_for(write_future));
+    EXPECT_EQ(ECANCELED, write_future.get());
+    ASSERT_TRUE(wait_for(move_future));
+    EXPECT_EQ(ECANCELED, move_future.get());
+    ASSERT_TRUE(wait_for(test_future));
+    EXPECT_EQ(ECANCELED, test_future.get());
+    EXPECT_EQ(0U, local_data.enqueued_write_bytes());
+
+    raw_backend->release(1);
+    ASSERT_TRUE(wait_for(first_read_future));
+    EXPECT_EQ(0, first_read_future.get());
+    ASSERT_TRUE(wait_for(remove_future));
+    EXPECT_EQ(0, remove_future.get());
+    local_data.close_all();
+
+    EXPECT_EQ((std::vector<std::string>{ "1:read", "1:close_torrent", "1:remove" }), raw_backend->log());
+}
+
 TEST(LocalData, ShutdownDrainsWritesAndCancelsReads)
 {
     auto backend = std::make_unique<StubBackend>();

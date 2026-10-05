@@ -723,7 +723,6 @@ void tr_torrent::stop_now()
     set_is_queued(false);
 }
 
-// FIXME: this needs to be moved into session->local_data()
 // By-value: arguments are moved into the session-thread work item.
 void tr_torrentRemoveInSessionThread(
     tr_torrent* tor,
@@ -734,26 +733,28 @@ void tr_torrentRemoveInSessionThread(
 
     if (delete_flag && tor->has_metainfo())
     {
-        // ensure the files are all closed and idle before moving
-        tor->session->local_data.close_torrent(tor->id());
         tor->session->verify_remove(tor);
 
-        if (!remove_func)
-        {
-            remove_func = tr_sys_path_remove;
-        }
-
-        auto error = tr_error{};
-        tor->files().remove(tor->current_dir(), tor->name(), remove_func, &error);
-        if (error)
-        {
-            tr_logAddWarnTor(
-                tor,
-                fmt::format(
-                    fmt::runtime(_("Couldn't remove all torrent files: {error} ({error_code})")),
-                    fmt::arg("error", error.message()),
-                    fmt::arg("error_code", error.code())));
-        }
+        // LocalData deletes the files after the torrent's in-flight write,
+        // so that write cannot recreate a file once it is deleted.
+        tor->session->local_data.remove(
+            tor->id(),
+            tor->files(),
+            tor->current_dir().sv(),
+            tor->name(),
+            std::move(remove_func),
+            [name = std::string{ tor->name() }](tr_torrent_id_t /*tor_id*/, tr_error const& error)
+            {
+                if (error)
+                {
+                    tr_logAddWarn(
+                        fmt::format(
+                            fmt::runtime(_("Couldn't remove all torrent files: {error} ({error_code})")),
+                            fmt::arg("error", error.message()),
+                            fmt::arg("error_code", error.code())),
+                        name);
+                }
+            });
     }
 
     tr_torrentFreeInSessionThread(tor);
@@ -806,6 +807,7 @@ void tr_torrentFreeInSessionThread(tr_torrent* tor)
         tr_torrent_metainfo::remove_file(tor->session->resumeDir(), tor->name(), tor->info_hash_string(), ".resume"sv);
     }
 
+    tor->session->local_data.forget(tor->id());
     freeTorrent(tor);
 }
 
