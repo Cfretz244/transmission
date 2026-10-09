@@ -1282,6 +1282,14 @@ void tr_torrent::set_location(std::string_view location, bool move_from_old_path
             // being deleted. Just point it at the new location.
             if (!move_from_old_path || tor->deferred_init_)
             {
+                // Nothing is moved, but the torrent's cached file handles
+                // still point at the old location (the open-files cache is
+                // keyed by torrent and file index, not by path). Close them
+                // so later I/O reopens from the new dir, as stop and move
+                // do; otherwise the old files stay open and cannot be
+                // reclaimed once the caller deletes them. The close sits on
+                // the torrent's FIFO ahead of any I/O planned from here on.
+                session->local_data.close_torrent(tor_id);
                 tor->set_download_dir(path);
                 if (setme_state != nullptr)
                 {

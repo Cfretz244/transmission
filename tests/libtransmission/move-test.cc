@@ -5,10 +5,12 @@
 
 #include <algorithm>
 #include <ctime>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -984,6 +986,106 @@ TEST_F(MoveTest, setLocation)
         auto const expected = tr_pathbuf{ target_dir, '/', tr_torrentFile(tor, i).name };
         EXPECT_EQ(expected, tr_torrentFindFile(tor, i));
     }
+
+    // cleanup
+    tr_torrentRemove(tor, true);
+}
+
+#ifdef __linux__
+// Counts this process's open file descriptors whose target starts with `prefix`.
+[[nodiscard]] size_t countOpenFdsUnder(std::string_view prefix)
+{
+    auto n = size_t{};
+    auto ec = std::error_code{};
+    for (auto const& entry : std::filesystem::directory_iterator{ "/proc/self/fd", ec })
+    {
+        auto const target = std::filesystem::read_symlink(entry.path(), ec).string();
+        if (!ec && tr_strv_starts_with(target, prefix))
+        {
+            ++n;
+        }
+    }
+    return n;
+}
+#endif
+
+// set-location with move=false repoints the torrent at a copy someone
+// else made. The torrent's cached file handles must not keep serving
+// reads from the old location: a caller that deletes the originals next
+// (a seeding migration, say) could never reclaim them otherwise.
+TEST_F(MoveTest, setLocationWithoutMoveClosesFilesAtTheOldPath)
+{
+    auto* const tor = zeroTorrentInit(ZeroTorrentState::Complete);
+    blockingTorrentVerify(tor);
+    EXPECT_EQ(0, tr_torrentStat(tor).left_until_done);
+    auto const old_dir = std::string{ tr_sessionGetDownloadDir(session_) };
+    auto const old_file = std::string{ tr_torrentFindFile(tor, 0) };
+    ASSERT_TRUE(tr_strv_starts_with(old_file, old_dir));
+
+    // a copy of the torrent's files, with file 0 filled with 'x' instead of
+    // zeroes so a read says which location served it
+    auto const target_dir = tr_pathbuf{ session_->configDir(), "/target"sv };
+    auto const n = tr_torrentFileCount(tor);
+    for (tr_file_index_t i = 0; i < n; ++i)
+    {
+        auto const file = tr_torrentFile(tor, i);
+        auto const contents = std::string(file.length, i == 0U ? 'x' : '\0');
+        createFileWithContents(tr_pathbuf{ target_dir, '/', file.name }, contents);
+    }
+
+    // read block 0 so the torrent's handle for file 0 is cached open
+    auto const read_block_0 = [this, tor]()
+    {
+        auto bytes = std::string{};
+        auto done = false;
+        session_->run_in_session_thread(
+            [this, tor, &bytes, &done]()
+            {
+                session_->local_data.read(
+                    tor->make_io_plan(tor->block_info().byte_span_for_block(0U)),
+                    [&bytes, &done](
+                        tr_torrent_id_t,
+                        tr_byte_span_t,
+                        tr_error const& error,
+                        std::unique_ptr<tr::LocalData::BlockData> data)
+                    {
+                        EXPECT_FALSE(error) << error;
+                        if (data)
+                        {
+                            bytes.assign(reinterpret_cast<char const*>(std::data(*data)), std::size(*data));
+                        }
+                        done = true;
+                    });
+            });
+        EXPECT_TRUE(waitFor([&done]() { return done; }, MaxWaitMsec));
+        return bytes;
+    };
+    auto bytes = read_block_0();
+    ASSERT_EQ(tr_block_info::BlockSize, std::size(bytes));
+    EXPECT_EQ(std::string(tr_block_info::BlockSize, '\0'), bytes);
+#ifdef __linux__
+    EXPECT_EQ(1U, countOpenFdsUnder(old_file));
+#endif
+
+    // repoint the torrent at the copy, then delete the originals the way
+    // the caller would
+    auto state = -1;
+    tr_torrentSetLocation(tor, target_dir, false, &state);
+    EXPECT_TRUE(waitFor([&state]() { return state == TR_LOC_DONE; }, MaxWaitMsec));
+    EXPECT_EQ(TR_LOC_DONE, state);
+    for (tr_file_index_t i = 0; i < n; ++i)
+    {
+        EXPECT_TRUE(tr_sys_path_remove(tr_pathbuf{ old_dir, '/', tr_torrentFile(tor, i).name }));
+    }
+
+    // the torrent now reads from the copy, and holds nothing open at the old location
+    EXPECT_EQ(tr_pathbuf(target_dir, '/', tr_torrentFile(tor, 0).name), tr_torrentFindFile(tor, 0));
+    bytes = read_block_0();
+    ASSERT_EQ(tr_block_info::BlockSize, std::size(bytes));
+    EXPECT_EQ(std::string(tr_block_info::BlockSize, 'x'), bytes);
+#ifdef __linux__
+    EXPECT_EQ(0U, countOpenFdsUnder(old_dir));
+#endif
 
     // cleanup
     tr_torrentRemove(tor, true);
